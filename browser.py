@@ -10,6 +10,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -111,7 +112,7 @@ class BossBrowser:
     async def is_logged_in(self):
         if not self.is_alive or not is_boss_url(self.page.url):
             return False
-        state = await self.page.evaluate("""() => {
+        inspection = """() => {
             const visible = e => { const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return !!(r.width&&r.height&&s.display!=='none'&&s.visibility!=='hidden'); };
             return {
                 path:location.pathname,
@@ -119,11 +120,20 @@ class BossBrowser:
                 nav:Array.from(document.querySelectorAll('.user-nav,.btn-post-job,.nav-figure,.menu-list')).some(visible),
                 workspace:['推荐牛人','职位管理','推荐人才'].some(label=>(document.body.innerText||'').includes(label))
             };
-        }""")
-        if state["login"] or state["path"].startswith("/web/user"):
-            return False
-        backend = state["path"].startswith(("/web/boss/", "/web/chat/"))
-        return bool(state["nav"] or (backend and state["workspace"]))
+        }"""
+        # A restored/background tab can briefly have a backend URL but no SPA
+        # navigation yet. Inspect its DOM without refreshing or navigating.
+        deadline = time.monotonic() + 5
+        while True:
+            state = await self.page.evaluate(inspection)
+            if state["login"] or state["path"].startswith("/web/user"):
+                return False
+            backend = state["path"].startswith(("/web/boss/", "/web/chat/"))
+            if state["nav"] or (backend and state["workspace"]):
+                return True
+            if not backend or time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.2)
 
     async def _check_current_page_logged_in(self):
         return await self.is_logged_in()

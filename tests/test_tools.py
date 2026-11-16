@@ -75,6 +75,19 @@ async def test_transport_does_not_enable_runtime_or_modify_console(app):
 
 
 @pytest.mark.asyncio
+async def test_login_waits_for_backend_navigation_without_reloading(app):
+    await app["page"].evaluate("""() => {
+        const menu = document.querySelector('.menu-list');
+        menu.style.display = 'none';
+        window.fixturePageMarker = 'same-document';
+        setTimeout(() => { menu.style.display = ''; }, 500);
+    }""")
+    async with Client(app["server"].mcp) as client:
+        assert (await call(client, "boss_login"))["status"] == "success"
+    assert await app["page"].evaluate("fixturePageMarker") == "same-document"
+
+
+@pytest.mark.asyncio
 async def test_multi_search_auto_view_and_input_validation(app):
     async with Client(app["server"].mcp) as client:
         result = await call(client, "boss_multi_search", keywords=["Python"], count_per_keyword=1, auto_view=True)
