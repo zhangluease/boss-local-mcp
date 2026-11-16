@@ -72,7 +72,12 @@ def chrome_endpoint(tmp_path_factory):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     profile = tmp_path_factory.mktemp("headless-chrome")
-    process = subprocess.Popen([executable, "--headless=new", f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    arguments = [executable, "--headless=new", f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", "about:blank"]
+    if os.getenv("BOSS_TEST_NO_SANDBOX") == "1":
+        arguments.insert(1, "--no-sandbox")
+    log_path = profile / "chrome.log"
+    browser_log = log_path.open("w")
+    process = subprocess.Popen(arguments, stdout=browser_log, stderr=browser_log)
     endpoint = f"http://127.0.0.1:{port}"
     try:
         for _ in range(100):
@@ -81,7 +86,7 @@ def chrome_endpoint(tmp_path_factory):
                     break
             except Exception:
                 if process.poll() is not None:
-                    pytest.fail("Headless Chrome exited during startup")
+                    pytest.fail("Headless Chrome exited during startup:\n" + log_path.read_text(errors="replace")[-2000:])
                 time.sleep(0.1)
         else:
             pytest.fail("Headless Chrome did not start")
@@ -93,6 +98,7 @@ def chrome_endpoint(tmp_path_factory):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        browser_log.close()
 
 
 @pytest_asyncio.fixture
