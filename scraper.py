@@ -198,26 +198,29 @@ class BossScraper:
         """Navigate to search page and return the search iframe's Frame object."""
         existing = await p.query_selector("#searchContent iframe")
         if existing:
-            self._search_frame = await existing.content_frame()
-            return self._search_frame
+            frame = await existing.content_frame()
+            if frame:
+                await frame.wait_for_selector("input.search-input", timeout=10000)
+                self._search_frame = frame
+                return frame
         search_menu = await p.query_selector("dl.menu-geeksearch")
         if not search_menu:
             # Not on recruiter SPA — navigate there first
             from config import BOSS_SEARCH_URL
             log.info(f"Navigating to recruiter search page: {BOSS_SEARCH_URL}")
             await p.goto(BOSS_SEARCH_URL, wait_until="domcontentloaded")
-            await _wait(3)
-            search_menu = await p.query_selector("dl.menu-geeksearch")
+            search_menu = await p.wait_for_selector("dl.menu-geeksearch", timeout=10000)
 
         if search_menu:
             await search_menu.click()
-            await _wait(2)
 
-        iframe_el = await p.query_selector("#searchContent iframe")
-        if not iframe_el:
-            return None
-        self._search_frame = await iframe_el.content_frame()
-        return self._search_frame
+        iframe_el = await p.wait_for_selector("#searchContent iframe", timeout=10000)
+        frame = await iframe_el.content_frame()
+        if not frame:
+            raise RuntimeError("搜索 iframe 尚未就绪")
+        await frame.wait_for_selector("input.search-input", timeout=10000)
+        self._search_frame = frame
+        return frame
 
     async def search_candidates(
         self,

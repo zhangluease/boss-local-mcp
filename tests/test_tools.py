@@ -87,6 +87,21 @@ async def test_multi_search_auto_view_and_input_validation(app):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("already_open", [False, True])
+async def test_search_waits_for_a_slow_iframe_document(app, already_open):
+    await app["page"].evaluate("""alreadyOpen => {
+        window.showSearch = () => {
+            document.getElementById('searchContent').innerHTML = '<iframe src="/search?delay=0.5"></iframe>';
+        };
+        if (alreadyOpen) showSearch();
+    }""", already_open)
+    async with Client(app["server"].mcp) as client:
+        result = await call(client, "boss_multi_search", keywords=["Python"], count_per_keyword=1, auto_view=True)
+        assert result[0]["total_new"] == 1, result
+        assert (await call(client, "boss_query_db", has_share_url=True))[0]["share_url"]
+
+
+@pytest.mark.asyncio
 async def test_failed_greeting_does_not_mark_candidate_greeted(app, monkeypatch):
     app["server"]._db.add({"expectId": "fixture-0"})
     from scraper import BossScraper

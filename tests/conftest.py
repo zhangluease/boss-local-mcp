@@ -11,6 +11,7 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import pytest_asyncio
@@ -33,6 +34,8 @@ def fixture_site():
                 body = json.dumps({"zpData": {"geekList": [{"expectId": f"fixture-{i}", "salaryDesc": "20-30K", "encryptGeekId": f"geek-{i}"} for i in range(2)]}}).encode()
                 mime = "application/json"
             elif self.path.startswith("/search"):
+                delay = float(parse_qs(urlsplit(self.path).query).get("delay", ["0"])[0])
+                time.sleep(min(delay, 1))
                 body = (FIXTURES / "search.html").read_bytes()
                 mime = "text/html; charset=utf-8"
             elif self.path.startswith("/c-resume"):
