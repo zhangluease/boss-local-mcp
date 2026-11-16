@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   test:
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +27,18 @@ jobs:
           enable-cache: true
       - uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4
         id: chrome
+      - name: Preserve macOS Chrome application bundle
+        if: runner.os == 'macOS'
+        id: chrome-app
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          app_root="${CHROME_PATH%/Contents/MacOS/*}"
+          if [[ "$app_root" != *.app ]]; then
+            app_root="$RUNNER_TEMP/Google Chrome for Testing.app"
+            ditto "${CHROME_PATH%/Contents/MacOS/*}" "$app_root"
+          fi
+          echo "chrome-path=$app_root/Contents/MacOS/Google Chrome for Testing" >> "$GITHUB_OUTPUT"
       - name: Install macOS QR dependency
         if: runner.os == 'macOS'
         run: brew install zbar
@@ -35,7 +48,8 @@ jobs:
       - run: uv sync --extra test --locked --python '${{ matrix.python }}'
       - name: Test without contacting BOSS
         env:
-          BOSS_TEST_CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          PYTHONUNBUFFERED: "1"
+          BOSS_TEST_CHROME_PATH: ${{ steps.chrome-app.outputs.chrome-path || steps.chrome.outputs.chrome-path }}
           BOSS_TEST_NO_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
-        run: uv run --python '${{ matrix.python }}' pytest -q
+        run: uv run --python '${{ matrix.python }}' pytest -vv --durations=10
       - run: uv build --wheel

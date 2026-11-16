@@ -89,7 +89,7 @@ def chrome_endpoint(tmp_path_factory):
                     pytest.fail("Headless Chrome exited during startup:\n" + log_path.read_text(errors="replace")[-2000:])
                 time.sleep(0.1)
         else:
-            pytest.fail("Headless Chrome did not start")
+            pytest.fail("Headless Chrome did not start:\n" + log_path.read_text(errors="replace")[-6000:])
         yield endpoint
     finally:
         process.terminate()
@@ -113,7 +113,16 @@ async def app(chrome_endpoint, fixture_site, tmp_path, monkeypatch):
 
     connection = await CDPConnection.connect(chrome_endpoint)
     target = await connection.command("Target.createTarget", {"url": fixture_site + "/web/chat/index"})
-    page = await connection.attach({"targetId": target["targetId"], "url": fixture_site + "/web/chat/index"})
+    try:
+        page = await connection.attach({"targetId": target["targetId"], "url": fixture_site + "/web/chat/index"})
+    except Exception:
+        # Renderer startup failures can leave the browser endpoint responsive.
+        # Keep the actual Chrome error in CI instead of only a CDP timeout.
+        print("Chrome endpoint:", chrome_endpoint, flush=True)
+        for log_path in tmp_path.parent.glob("headless-chrome*/chrome.log"):
+            print(log_path.read_text(errors="replace")[-6000:], flush=True)
+        await connection.close()
+        raise
     await page.wait_for_selector(".menu-list")
     browser = BossBrowser()
     browser._browser, browser._page = connection, page
