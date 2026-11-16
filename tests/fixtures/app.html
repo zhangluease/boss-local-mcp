@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>本地招聘测试</title>
+<style>body{font:16px sans-serif;margin:20px}dl{padding:12px;background:#eee;width:130px;cursor:pointer}iframe{width:100%;height:700px;border:0}.boss-dialog__body{position:fixed;inset:20px;background:white;border:2px solid #444;z-index:10}.boss-dialog__close{float:right;width:50px;height:30px}.boss-popup__wrapper{position:fixed;top:30px;left:50px;background:white;z-index:20;padding:15px}button{padding:10px}li{padding:15px}</style>
+<div class="menu-list"><dl class="menu-geeksearch" onclick="showSearch()"><span>搜索</span></dl>职位管理 推荐牛人</div>
+<div id="searchContent"></div>
+<script>
+window.fixtureGreetings=0;window.fixtureMessages=[];
+function showSearch(){document.getElementById('searchContent').innerHTML='<iframe src="/search"></iframe>'}
+function closeResume(){document.querySelectorAll('.boss-dialog__body,.boss-popup__wrapper').forEach(e=>e.remove())}
+function showResume(index){
+ closeResume();const box=document.createElement('div');box.className='boss-dialog__body';
+ box.innerHTML=`<button class="boss-dialog__close" onclick="closeResume()">关闭</button><div data-geekid="geek-${index}" data-expectid="fixture-${index}" data-jid="job-1"></div><button class="btn-getcontact" onclick="contact(this)">联系Ta</button><iframe src="/c-resume"></iframe>`;document.body.appendChild(box);
+}
+function contact(button){window.fixtureGreetings++;button.insertAdjacentHTML('afterend','<textarea class="chat-input"></textarea><button class="btn-send" onclick="send(this)">发送</button>')}
+function send(button){window.fixtureMessages.push(button.previousElementSibling.value)}
+function showShare(){const panel=document.createElement('div');panel.className='boss-popup__wrapper';panel.innerHTML='<div class="c-pay-4-another"><button class="item" onclick="showQR(this)">转发至其他</button></div>';document.body.appendChild(panel)}
+function showQR(button){button.insertAdjacentHTML('afterend','<img class="share-image" src="__QR_DATA__">')}
+</script>

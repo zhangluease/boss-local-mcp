@@ -1,0 +1,11 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>本地搜索</title>
+<style>body{font:16px sans-serif}li{padding:16px;border-bottom:1px solid #ddd}a{display:block;cursor:pointer}</style>
+<input class="search-input" aria-label="关键词"><ul id="results"></ul>
+<script>
+const records=[
+ {expectId:'fixture-0',name:'测试甲',age:'27岁',salary:'20-30K·13薪',education:'本科',skills:['Python','SQL','Agent']},
+ {expectId:'fixture-1',name:'测试乙',age:'42岁',salary:'15-20K·24薪',education:'硕士',skills:['Python','SQL']}
+];
+function render(){document.getElementById('results').innerHTML=records.map((record,index)=>`<li class="geek-info-card"><a data-contact="yes" data-expect="${record.expectId}" data-jid="job-1" onclick="parent.showResume(${index})">${record.name}<div>${record.age}  5年  ${record.education}  离职-随时到岗  ${record.salary}</div><div class="rcd-tags">${record.skills.map(s=>'<span>'+s+'</span>').join('')}</div><div>期望城市</div><div>测试市</div><div>职位</div><div>本地测试公司</div><div>Python工程师</div><div>院校</div><div>测试大学</div><div>计算机</div></a></li>`).join('')}
+document.querySelector('input').addEventListener('keydown',async event=>{if(event.key==='Enter'){await fetch('/api/searchGeek');render()}});render();
+</script>

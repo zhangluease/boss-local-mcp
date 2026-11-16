@@ -1,0 +1,37 @@
+job:
+  title: Python 工程师
+  salary: 20-30K
+  city: 北京
+  experience: 3-5年
+
+company:
+  name: 示例公司
+  description: 请按实际招聘需求填写
+
+requirements:
+  must_have:
+    - Python 开发经验
+    - SQL 数据处理经验
+  nice_to_have:
+    - 了解异步服务和自动化测试
+
+keywords:
+  - Python
+  - Python SQL
+
+# 仅显式配置的条件参与过滤；不配置即不限制。
+filter:
+  max_salary_k: 40
+  exclude_status:
+    - 暂不考虑
+
+scoring:
+  domain_keywords:
+    - 后端
+    - 数据处理
+  tech_keywords:
+    - Python
+    - SQL
+    - asyncio
+  bonus_keywords:
+    - 自动化测试

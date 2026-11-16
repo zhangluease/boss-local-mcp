@@ -1,0 +1,38 @@
+[project]
+name = "boss-local-mcp"
+version = "0.1.0"
+description = "Local BOSS Zhipin recruiter MCP server"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+  "fastmcp>=2.14,<5",
+  "websockets>=15,<18",
+  "pyyaml>=6,<7",
+  "python-dotenv>=1,<2",
+  "pillow>=10,<14",
+  "pyzbar==0.1.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<10", "pytest-asyncio>=0.24,<2", "qrcode>=8,<9"]
+cloud-ocr = ["anthropic>=0.30,<3"]
+
+[project.scripts]
+boss-local-mcp = "cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["browser", "candidate_db", "cdp", "cli", "config", "evaluator", "filters", "ocr", "qr", "ranking", "scraper", "server"]
+packages = ["boss_local_assets"]
+
+[tool.setuptools.package-data]
+boss_local_assets = ["*.swift"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
