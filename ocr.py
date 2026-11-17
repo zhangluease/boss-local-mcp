@@ -67,7 +67,7 @@ def ocr_image(image_bytes: bytes, engine="auto") -> str:
         with os.fdopen(descriptor, "wb") as output:
             output.write(image_bytes)
         command = [str(_native_binary()), filename] if engine == "apple-vision" else ["tesseract", filename, "stdout", "-l", os.getenv("BOSS_OCR_LANG", "eng")]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=60)
         if result.returncode:
             raise RuntimeError("OCR 识别失败：" + result.stderr[-1000:])
         return json.loads(result.stdout)["text"] if engine == "apple-vision" else result.stdout

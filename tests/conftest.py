@@ -45,7 +45,7 @@ def fixture_site():
                 body = '''<!doctype html><title>测试简历</title><p>Python SQL 项目经验</p><button class="btn-greet" onclick="contact(this)">打招呼</button><script>window.fixtureGreetings=0;window.fixtureMessages=[];function contact(button){fixtureGreetings++;button.insertAdjacentHTML('afterend','<textarea class="chat-input"></textarea><button class="btn-send" onclick="fixtureMessages.push(this.previousElementSibling.value)">发送</button>')}</script>'''.encode()
                 mime = "text/html; charset=utf-8"
             else:
-                body = (FIXTURES / "app.html").read_text().replace("__QR_DATA__", qr).encode()
+                body = (FIXTURES / "app.html").read_text(encoding="utf-8").replace("__QR_DATA__", qr).encode("utf-8")
                 mime = "text/html; charset=utf-8"
             self.send_response(200)
             self.send_header("Content-Type", mime)

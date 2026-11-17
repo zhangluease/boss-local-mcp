@@ -7,8 +7,10 @@ def test_persistence_dedup_and_copy_isolation(tmp_path):
     path = str(tmp_path / "nested" / "db.json")
     database = CandidateDB(path)
     assert not database.add({"expectId": None})
-    assert database.bulk_add([{"expectId": 1, "skills": ["Python"]}, {"expectId": "1"}]) == (1, 1)
+    assert database.bulk_add([{"expectId": 1, "name": "测试候选人", "skills": ["Python"]}, {"expectId": "1"}], source_keyword="开发") == (1, 1)
     assert CandidateDB(path).get("1")["expectId"] == "1"
+    assert CandidateDB(path).get("1")["name"] == "测试候选人"
+    assert CandidateDB(path).get("1")["source_keyword"] == "开发"
     copy = database.query()[0]
     copy["skills"].append("SQL")
     assert database.get("1")["skills"] == ["Python"]
@@ -39,7 +41,8 @@ def test_salary_parser_and_no_demographic_filtering(tmp_path):
 
 def test_legacy_migration(tmp_path):
     old = tmp_path / "old.json"
-    old.write_text('{"ids":["a","b"]}')
+    old.write_text('{"ids":["甲","乙"]}', encoding="utf-8")
     database = CandidateDB(str(tmp_path / "new.json"), str(old))
     assert database.stats()["by_status"] == {"legacy": 2}
+    assert database.has("甲") and database.has("乙")
     assert old.with_suffix(".json.bak").exists()

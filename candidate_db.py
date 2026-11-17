@@ -30,7 +30,7 @@ class CandidateDB:
         log.info(f"CandidateDB loaded: {len(self._data['candidates'])} candidates")
 
     def _load(self):
-        with open(self._path, "r") as f:
+        with open(self._path, "r", encoding="utf-8") as f:
             self._data = json.load(f)
 
     def _save(self):
@@ -51,7 +51,7 @@ class CandidateDB:
     def _migrate_legacy(self, legacy_path: str):
         """Import bare IDs from seen_candidates.json as legacy entries."""
         try:
-            with open(legacy_path, "r") as f:
+            with open(legacy_path, "r", encoding="utf-8") as f:
                 old = json.load(f)
             ids = old.get("ids", [])
             now = datetime.now().isoformat(timespec="seconds")

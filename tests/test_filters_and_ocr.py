@@ -66,3 +66,16 @@ def test_ocr_rejects_non_images_and_explicit_cloud_without_credentials(monkeypat
     Image.new("RGB", (20, 20)).save(output, format="PNG")
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         ocr.ocr_image(output.getvalue(), engine="anthropic")
+
+
+def test_local_ocr_preserves_utf8_process_output(monkeypatch):
+    import ocr
+    run = ocr.subprocess.run
+
+    def synthetic_tesseract(command, **options):
+        return run([sys.executable, "-c", "import sys;sys.stdout.buffer.write('候选人简历 Python'.encode('utf-8'))"], **options)
+
+    monkeypatch.setattr(ocr.subprocess, "run", synthetic_tesseract)
+    output = io.BytesIO()
+    Image.new("RGB", (20, 20)).save(output, format="PNG")
+    assert ocr.ocr_image(output.getvalue(), engine="tesseract") == "候选人简历 Python"
