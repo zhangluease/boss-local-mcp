@@ -82,13 +82,30 @@ async def boss_login() -> dict:
     """登录 BOSS 直聘招聘者账号。
 
     首次使用返回 waiting_for_login，由用户手动扫码或短信登录。
-    等待期间不会轮询跳转或刷新页面；完成后再次调用检查并保存 Cookie。
+    等待扫码前断开调试连接并保留 Chrome，不轮询或刷新页面。
+    返回 waiting_for_login 后等待用户完成；再次调用会重新连接、检查并保存 Cookie。
     """
+    global _browser, _scraper
     browser = await get_browser()
     if await browser.is_logged_in():
         await browser._save_cookies()
         return {"status": "success", "message": "已登录，Cookie 有效"}
-    return await browser.login()
+    try:
+        result = await browser.login()
+    finally:
+        # Match the working CLI handoff: leave Chrome open without keeping
+        # a debugger session attached while the user scans the QR code.
+        try:
+            await browser.close()
+        finally:
+            _browser = None
+            _scraper = None
+    return {
+        **result,
+        "browser_connection": "disconnected",
+        "next_action": "wait_for_user",
+        "message": "扫码页面已打开，调试连接已断开，Chrome 窗口会保留。请直接在 Chrome 中手动扫码；完成后再调用 boss_login 检查登录状态，等待期间不要刷新或使用其他浏览器工具接管页面。",
+    }
 
 
 @mcp.tool()

@@ -15,7 +15,7 @@
 
 详细范围、结果与复测方法见 [功能验证记录](docs/validation.md)。
 
-2026-11-17 新增项目本地 Chrome 固定版本安装，本机 47 项自动化测试通过，包含安装、版本校验和原有业务回归。
+2026-11-17 新增项目本地 Chrome 固定版本安装及扫码等待时释放连接，本机 49 项自动化测试通过，包含安装、版本校验和原有业务回归。
 
 ## 快速开始
 
@@ -112,7 +112,7 @@ uv run boss-local-mcp check
 
 若客户端尚未显示新工具，重新加载 MCP 服务或重启客户端。
 
-WorkBuddy 使用标准 stdio MCP 配置：Windows 的启动程序选择项目内 `.venv\Scripts\python.exe`，macOS / Linux 选择 `.venv/bin/python`，参数为项目 `server.py` 的绝对路径。业务操作调用 `boss_*` 工具；扫码阶段返回 `waiting_for_login` 后等待用户完成。
+WorkBuddy 使用标准 stdio MCP 配置：Windows 的启动程序选择项目内 `.venv\Scripts\python.exe`，macOS / Linux 选择 `.venv/bin/python`，参数为项目 `server.py` 的绝对路径。业务操作调用 `boss_*` 工具；扫码阶段返回 `waiting_for_login` 和 `next_action: wait_for_user` 后等待用户完成。更新项目代码后重启 MCP 服务，以加载新的工具逻辑。
 
 macOS 也提供三个可双击的入口：`open-boss.command` 打开浏览器，`test-mcp.command` 检查 MCP，`start-mcp.command` 启动 stdio 服务。
 
@@ -182,6 +182,12 @@ macOS 也提供三个可双击的入口：`open-boss.command` 打开浏览器，
 排查时捕获到 BOSS 页面脚本主动调用 `window.close()`；页面在未点击登录时也会关闭。断开旧调试连接后可正常扫码。BOSS 的[官方帮助](https://www.zhipin.com/faq/web/13/)要求关闭调试窗口。
 
 本项目使用按需 CDP 命令，不订阅运行时控制台事件。新连接层已通过真实搜索、截图、分享链接、OCR 和批量操作验收。浏览器操作串行执行，点击前检查目标是否被弹窗遮挡，防止把点击落到其他控件上。
+
+`boss_login` 未登录时，会打开扫码页面，在返回前断开调试连接并保留 Chrome，响应中包含 `browser_connection: disconnected`。等待扫码期间没有本项目维持的后台调试连接，也不轮询或刷新。用户扫码完成后再次调用 `boss_login`，服务重新连接现有窗口、确认登录并保存 Cookie；登录成功后的业务操作照常使用连接。
+
+给 WorkBuddy 的操作指令可使用：“只调用 boss-local-mcp 的 boss_login 一次。返回 waiting_for_login 后停止操作，等待我扫码完成；不要用其他浏览器工具接管、刷新或重新打开窗口。我确认完成后，再调用 boss_login。”
+
+Windows 同事已反馈独立命令行打开的扫码窗口不会自动关闭；本次将 MCP 的扫码等待阶段与该方式对齐。此反馈没有确认全部关闭原因，实际 Windows + WorkBuddy 登录仍需要更新后复测。
 
 网站更新、账号权限、登录失效和安全验证仍可能影响页面操作；工具会返回具体结果，遇到验证码时由用户在浏览器中完成。
 

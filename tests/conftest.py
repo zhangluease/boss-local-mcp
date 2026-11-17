@@ -131,6 +131,7 @@ async def app(chrome_endpoint, fixture_site, tmp_path, monkeypatch):
     browser._browser, browser._page = connection, page
     monkeypatch.setattr(browser_module, "is_boss_url", lambda url: url.startswith(fixture_site))
     monkeypatch.setattr(browser_module, "BOSS_BASE_URL", fixture_site)
+    monkeypatch.setattr(browser_module, "CDP_URL", chrome_endpoint)
     monkeypatch.setattr(browser_module, "COOKIES_FILE", str(tmp_path / "cookies.json"))
     monkeypatch.setattr(config, "BOSS_SEARCH_URL", fixture_site + "/web/chat/search")
     monkeypatch.setattr(scraper_module, "BOSS_BASE_URL", fixture_site)
@@ -143,6 +144,9 @@ async def app(chrome_endpoint, fixture_site, tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_db", CandidateDB(str(tmp_path / "candidates.json")))
     monkeypatch.setattr(server, "PROFILE", {"job": {"title": "测试工程师", "city": "测试市"}, "keywords": ["Python", "SQL"], "scoring": {"tech_keywords": ["Python", "SQL"]}})
     yield {"browser": browser, "page": page, "server": server, "base": fixture_site, "tmp": tmp_path, "endpoint": chrome_endpoint}
+    active = server._browser
+    if active is not None and active._browser is not connection:
+        await active.close()
     cleanup = connection if connection.is_connected() else await CDPConnection.connect(chrome_endpoint)
     try:
         await cleanup.command("Target.closeTarget", {"targetId": target["targetId"]})

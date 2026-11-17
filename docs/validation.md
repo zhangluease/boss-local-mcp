@@ -85,3 +85,15 @@ uv run python scripts/live_smoke.py --keyword Python --secondary SQL --count 2
 | Windows CI 使用默认 cp1252，中文模拟页面无法读取 | 文本读写不能假定系统默认编码为 UTF-8 | 模拟服务器、`candidate_db.py` 与 `ocr.py` 显式使用 UTF-8，并验证中文数据往返及 OCR 输出 |
 
 CI 新增 Windows，并改为执行本项目安装入口，随后验证本地模拟页面；云端不登录真实账号。原有 2026-11-16 的真实账号记录仍按上述范围解读。
+
+## 2026-11-17：扫码等待时释放连接
+
+Windows 同事反馈，独立 PowerShell 执行 `python -m cli browser` 后扫码窗口可以保留。命令行入口原本会在返回前断开调试连接，MCP 未登录分支则会保留连接。本次将 MCP 等待扫码分支也改为短连接，并清理共享的浏览器及搜索器引用；发生登录导航异常时同样释放连接。
+
+| 证据 | 发现 | 路径 |
+| --- | --- | --- |
+| CLI 能保留窗口，且其 finally 会断开连接 | MCP 等待扫码时的连接生命周期与 CLI 不同 | `server.py`：未登录时在返回前断开 CDP，保留 Chrome，并返回 `next_action: wait_for_user` |
+| 回归测试断开后仍能找到原标签页，原文档标记仍在 | 释放连接未关闭或刷新扫码页 | `tests/test_tools.py`：模拟用户登录后重新连接、保存 Cookie 并继续搜索 |
+| 导航异常后连接已关闭，共享引用为空 | 失败路径也不遗留调试连接 | `tests/test_tools.py`：登录导航异常用例 |
+
+本机 49 项测试通过。测试使用本地模拟页面，不向真实候选人发送消息；当前证据不等同于确认 Windows + WorkBuddy 的全部关闭原因，仍需同事更新并重启 MCP 后复测真实扫码。

@@ -88,6 +88,59 @@ async def test_login_waits_for_backend_navigation_without_reloading(app):
 
 
 @pytest.mark.asyncio
+async def test_scan_handoff_disconnects_and_reconnects_after_manual_login(app):
+    from cdp import CDPConnection
+    page, server = app["page"], app["server"]
+    await page.goto(app["base"] + "/web/user/?intent=1")
+    await page.evaluate("window.fixtureLoginMarker = 'same-login-document'")
+    original_connection = app["browser"]._browser
+    target_id = page.target_id
+    async with Client(server.mcp) as client:
+        result = await call(client, "boss_login")
+        assert result["status"] == "waiting_for_login"
+        assert result["browser_connection"] == "disconnected"
+        assert result["next_action"] == "wait_for_user"
+        assert not original_connection.is_connected()
+        assert server._browser is None and server._scraper is None
+
+        # A separate short-lived connection models the user's manual browser
+        # interaction. The original tab and its document must still exist.
+        observer = await CDPConnection.connect(app["endpoint"])
+        try:
+            target = next(t for t in await observer.pages() if t["targetId"] == target_id)
+            retained = await observer.attach(target)
+            assert await retained.evaluate("fixtureLoginMarker") == "same-login-document"
+            await retained.goto(app["base"] + "/web/chat/index")
+            await retained.wait_for_selector(".menu-list")
+        finally:
+            await observer.close()
+
+        assert (await call(client, "boss_login"))["status"] == "success"
+        assert server._browser.page.target_id == target_id
+        assert (app["tmp"] / "cookies.json").is_file()
+        found = await call(client, "boss_search_candidates", keyword="Python", count=1)
+        assert found[0]["new"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_login_navigation_also_releases_the_connection(app, monkeypatch):
+    async def not_logged_in():
+        return False
+
+    async def fail():
+        raise RuntimeError("Synthetic login navigation failure")
+
+    connection = app["browser"]._browser
+    monkeypatch.setattr(app["browser"], "is_logged_in", not_logged_in)
+    monkeypatch.setattr(app["browser"], "login", fail)
+    async with Client(app["server"].mcp) as client:
+        with pytest.raises(Exception, match="Synthetic login navigation failure"):
+            await client.call_tool("boss_login", {})
+    assert not connection.is_connected()
+    assert app["server"]._browser is None and app["server"]._scraper is None
+
+
+@pytest.mark.asyncio
 async def test_multi_search_auto_view_and_input_validation(app):
     async with Client(app["server"].mcp) as client:
         result = await call(client, "boss_multi_search", keywords=["Python"], count_per_keyword=1, auto_view=True)
