@@ -34,27 +34,44 @@ async def check():
 
 
 def doctor():
-    import shutil
+    from browser_install import CHROME_VERSION, configured_executable, executable_version, require_version
     from qr import HAS_QR_DECODER
     from ocr import available_engine
     from config import CHROME_PROFILE_DIR, DATA_DIR
+    executable = configured_executable()
+    version, error = None, None
+    try:
+        version = executable_version(executable)
+        require_version(version)
+    except Exception as failure:
+        error = str(failure)
     print(json.dumps({
         "python": sys.version.split()[0], "qr_decoder": HAS_QR_DECODER,
-        "chrome": Path("/Applications/Google Chrome.app").exists() if sys.platform == "darwin" else bool(shutil.which("google-chrome") or shutil.which("chromium")),
+        "chrome": version == CHROME_VERSION,
+        "chrome_path": str(executable), "chrome_version": version,
+        "required_chrome_version": CHROME_VERSION, "chrome_error": error,
         "local_ocr": available_engine(),
         "data_dir": str(DATA_DIR), "chrome_profile": CHROME_PROFILE_DIR,
     }, ensure_ascii=False, indent=2))
+    return 0 if version == CHROME_VERSION and HAS_QR_DECODER else 1
 
 
 def main():
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="BOSS recruiter local MCP server")
-    parser.add_argument("command", nargs="?", choices=("serve", "browser", "check", "doctor"), default="serve")
+    parser.add_argument("command", nargs="?", choices=("serve", "browser", "check", "doctor", "install-browser"), default="serve")
     arguments = parser.parse_args()
     if arguments.command == "serve":
         from server import mcp
         mcp.run()
+    elif arguments.command == "install-browser":
+        from browser_install import install_browser
+        print(json.dumps(install_browser(), ensure_ascii=False, indent=2))
     elif arguments.command == "doctor":
-        doctor()
+        raise SystemExit(doctor())
     else:
         asyncio.run(open_browser() if arguments.command == "browser" else check())
 

@@ -1,0 +1,12 @@
+{
+  "version": "157.0.8103.78",
+  "download_base": "https://storage.googleapis.com/chrome-for-testing-public",
+  "executables": {
+    "mac-arm64": "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "mac-x64": "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "win64": "chrome-win64/chrome.exe",
+    "win32": "chrome-win32/chrome.exe",
+    "linux64": "chrome-linux64/chrome",
+    "linux-arm64": "chrome-linux-arm64/chrome"
+  }
+}

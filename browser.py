@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import random
-import shutil
 import subprocess
 import sys
 import time
@@ -15,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cdp import CDPConnection
+from browser_install import BrowserVersionError, configured_executable, executable_version, require_version
 from config import BOSS_BASE_URL, CHROME_PROFILE_DIR, COOKIES_FILE, MAX_DELAY, MIN_DELAY
 
 log = logging.getLogger("boss-local-browser")
@@ -45,6 +45,7 @@ class BossBrowser:
         connection = None
         try:
             connection = await CDPConnection.connect(url)
+            require_version(connection.browser_version)
             pages = await connection.pages()
             boss_pages = [page for page in pages if is_boss_url(page.get("url", ""))]
             backend = [page for page in boss_pages if urlsplit(page["url"]).path.startswith(("/web/boss/", "/web/chat/"))]
@@ -56,6 +57,10 @@ class BossBrowser:
             self._page = await connection.attach(target)
             self._browser = connection
             return True
+        except BrowserVersionError:
+            if connection:
+                await connection.close()
+            raise
         except Exception as error:
             if connection:
                 await connection.close()
@@ -63,22 +68,15 @@ class BossBrowser:
             return False
 
     async def _launch_system_chrome(self):
-        executable = os.getenv("BOSS_CHROME_PATH")
-        if not executable:
-            if sys.platform == "darwin":
-                executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            elif sys.platform == "win32":
-                executable = str(Path(os.getenv("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe")
-            else:
-                executable = shutil.which("google-chrome") or shutil.which("chromium")
-        if not executable or not Path(executable).is_file():
-            raise RuntimeError("未找到 Google Chrome；请安装 Chrome 或设置 BOSS_CHROME_PATH。")
+        executable = configured_executable()
+        require_version(executable_version(executable))
         port = urlsplit(CDP_URL).port or 9222
         Path(CHROME_PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+        options = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {"start_new_session": True}
         subprocess.Popen([
-            executable, f"--remote-debugging-port={port}",
+            str(executable), f"--remote-debugging-port={port}",
             f"--user-data-dir={CHROME_PROFILE_DIR}", "--no-first-run", "--no-default-browser-check",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
 
     @property
     def page(self):

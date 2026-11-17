@@ -24,8 +24,9 @@ class CDPError(RuntimeError):
 
 
 class CDPConnection:
-    def __init__(self, socket):
+    def __init__(self, socket, browser_version=""):
         self.socket = socket
+        self.browser_version = browser_version
         self._next_id = 0
         self._pending = {}
         self._listeners = {}
@@ -46,7 +47,7 @@ class CDPConnection:
             version["webSocketDebuggerUrl"], proxy=None, max_size=32 * 1024 * 1024,
             open_timeout=5,
         )
-        return cls(socket)
+        return cls(socket, browser_version=version.get("Browser", ""))
 
     async def _receive(self):
         try:

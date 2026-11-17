@@ -70,3 +70,17 @@ uv run python scripts/live_smoke.py --keyword Python --secondary SQL --count 2
 ```
 
 本机运行的摘要保存在被 Git 忽略的 `data/live-acceptance/summary.json`。真实候选人资料、Cookie、截图、账号配置和页面源码不随本仓库发布。
+
+## 2026-11-17：固定版本浏览器安装
+
+环境安装入口 `scripts/setup.sh` 和 `scripts/setup.ps1` 同时安装 Python 依赖和 Chrome for Testing，完整版本固定在 `boss_local_assets/browser.json`。默认安装目录为项目 `.browsers/157.0.8103.78/<平台>/`，登录资料继续使用独立的 `data/chrome-profile` 或已有显式配置。
+
+本机已从 Google 官方下载并安装 mac-arm64 浏览器，程序文件版本为 `157.0.8103.78`，重复安装返回 `already_installed`，临时 ZIP 自动删除。46 项本地测试通过，覆盖安装失败清理、版本不符拒绝连接、宿主工作目录变化、平台选择、下载互斥及原有业务功能。另使用项目内 CfT 执行浏览器回归测试。
+
+| 证据 | 发现 | 路径 |
+| --- | --- | --- |
+| 原实现默认查找系统 Chrome，已启动的调试端口可连接其他版本 | Python 依赖一致仍不能保证浏览器一致 | `browser_install.py`、`browser.py`、`cdp.py`：本地安装并校验文件版本和 CDP 版本 |
+| Windows 没有 POSIX 的新会话语义 | 同一个启动参数不能表达两端相同的控制台行为 | `browser.py`：Windows 分离控制台及独立进程组；不声称解决宿主 Job Object 清理 |
+| 从其他目录启动 Agent 时，工作目录会不同 | 相对路径不能依赖宿主当前目录 | `browser_install.py`：以项目根目录解析默认和显式相对路径 |
+
+CI 新增 Windows，并改为执行本项目安装入口，随后验证本地模拟页面；云端不登录真实账号。原有 2026-11-16 的真实账号记录仍按上述范围解读。

@@ -18,6 +18,8 @@ jobs:
             python: "3.12"
           - os: macos-15
             python: "3.14"
+          - os: windows-latest
+            python: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -25,31 +27,29 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
-      - uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4
-        id: chrome
-      - name: Preserve macOS Chrome application bundle
-        if: runner.os == 'macOS'
-        id: chrome-app
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: |
-          app_root="${CHROME_PATH%/Contents/MacOS/*}"
-          if [[ "$app_root" != *.app ]]; then
-            app_root="$RUNNER_TEMP/Google Chrome for Testing.app"
-            ditto "${CHROME_PATH%/Contents/MacOS/*}" "$app_root"
-          fi
-          echo "chrome-path=$app_root/Contents/MacOS/Google Chrome for Testing" >> "$GITHUB_OUTPUT"
       - name: Install macOS QR dependency
         if: runner.os == 'macOS'
         run: brew install zbar
       - name: Install Linux QR and OCR dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libzbar0 tesseract-ocr
+      - name: Install runtime on macOS or Linux
+        if: runner.os != 'Windows'
+        run: sh scripts/setup.sh
+      - name: Install runtime on Windows
+        if: runner.os == 'Windows'
+        run: .\scripts\setup.ps1
       - run: uv sync --extra test --locked --python '${{ matrix.python }}'
+      - name: Verify pinned browser installation can be reused
+        shell: bash
+        run: |
+          uv run --locked boss-local-mcp install-browser
+          chrome_path="$(uv run --locked python -c 'from browser_install import configured_executable; print(configured_executable())')"
+          echo "BOSS_TEST_CHROME_PATH=$chrome_path" >> "$GITHUB_ENV"
+          uv run --locked boss-local-mcp doctor
       - name: Test without contacting BOSS
         env:
           PYTHONUNBUFFERED: "1"
-          BOSS_TEST_CHROME_PATH: ${{ steps.chrome-app.outputs.chrome-path || steps.chrome.outputs.chrome-path }}
           BOSS_TEST_NO_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: uv run --python '${{ matrix.python }}' pytest -vv --durations=10
       - run: uv build --wheel

@@ -26,11 +26,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["browser", "candidate_db", "cdp", "cli", "config", "evaluator", "filters", "ocr", "qr", "ranking", "scraper", "server"]
+py-modules = ["browser", "browser_install", "candidate_db", "cdp", "cli", "config", "evaluator", "filters", "ocr", "qr", "ranking", "scraper", "server"]
 packages = ["boss_local_assets"]
 
 [tool.setuptools.package-data]
-boss_local_assets = ["*.swift"]
+boss_local_assets = ["*.swift", "*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
