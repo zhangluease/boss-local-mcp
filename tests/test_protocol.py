@@ -2,6 +2,7 @@ import asyncio
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -17,9 +18,15 @@ ROOT = Path(__file__).resolve().parents[1]
 async def test_stdio_can_start_from_another_working_directory(tmp_path):
     transport = StdioTransport(command=sys.executable, args=[str(ROOT / "server.py")], cwd=str(tmp_path), env={**os.environ, "BOSS_DATA_DIR": str(tmp_path / "stdio-data")})
     async with Client(transport, timeout=30) as client:
-        assert len(await client.list_tools()) == 17
+        assert "boss_export_filter_log" in {tool.name for tool in await client.list_tools()}
         result = await client.call_tool("boss_pipeline_status", {})
         assert result.data["total"] == 0
+        assert result.data["entrypoint"] == "mcp"
+        from contextlib import closing
+        with closing(sqlite3.connect(tmp_path / "stdio-data" / "run-history.sqlite3")) as history:
+            assert history.execute("SELECT tool, outcome FROM calls WHERE id=?", (result.data["call_id"],)).fetchone() == (
+                "boss_pipeline_status", "returned"
+            )
 
 
 @pytest.mark.asyncio
@@ -38,7 +45,7 @@ async def test_loopback_http_transport(tmp_path):
                 pytest.fail("HTTP MCP exited during startup")
             await asyncio.sleep(0.1)
         async with Client(f"http://127.0.0.1:{port}/mcp", timeout=30) as client:
-            assert len(await client.list_tools()) == 17
+            assert "boss_export_filter_log" in {tool.name for tool in await client.list_tools()}
             assert (await client.call_tool("boss_query_db", {})).data == []
     finally:
         process.terminate()

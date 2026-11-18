@@ -11,11 +11,11 @@ async def call(client, name, **arguments):
 
 
 @pytest.mark.asyncio
-async def test_all_seventeen_tools_in_local_recruiter_fixture(app):
+async def test_all_tools_in_local_recruiter_fixture(app):
     server, page = app["server"], app["page"]
     async with Client(server.mcp) as client:
         tools = await client.list_tools()
-        assert len(tools) == 17
+        assert len(tools) == 18
         assert (await call(client, "boss_login"))["status"] == "success"
         found = await call(client, "boss_search_candidates", keyword="Python", count=2)
         assert found[0]["new"] == 2
@@ -150,6 +150,112 @@ async def test_multi_search_auto_view_and_input_validation(app):
         assert (await call(client, "boss_view_by_expect_id", expect_id="missing"))["error"]
         assert (await call(client, "boss_update_candidate", expect_id="missing", status="viewed"))["status"] == "error"
         assert (await call(client, "boss_update_candidate", expect_id="fixture-0", score=101))["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_view_by_id_uses_the_actual_card_and_rejects_mismatched_dialog(app):
+    page, server = app["page"], app["server"]
+    async with Client(server.mcp) as client:
+        search = await call(client, "boss_search_candidates", keyword="Python", count=2)
+        batch = search[0]["batch_id"]
+        frame = server._scraper._search_frame
+        await frame.evaluate("document.querySelector('a[data-contact]').removeAttribute('data-expect')")
+        wrong_dialog = await page.evaluate("""() => {
+            window.fixtureOpen = window.showResume;
+            window.showResume = () => fixtureOpen(0);
+            return true;
+        }""")
+        assert wrong_dialog
+        failed = await call(client, "boss_view_by_expect_id", expect_id="fixture-1", batch_id=batch)
+        assert failed["error_code"] == "identity_mismatch"
+        assert "screenshots" not in failed
+        assert server._db.get("fixture-1")["status"] == "new"
+        await page.evaluate("window.showResume = window.fixtureOpen")
+        result = await call(client, "boss_view_by_expect_id", expect_id="fixture-1", batch_id=batch)
+        assert result["ids"]["expectId"] == "fixture-1"
+        assert result["identity_check"] == "verified"
+        update = await call(client, "boss_update_candidate", expect_id="fixture-1", batch_id=batch,
+                            notes="人工复核：项目职责待面试确认")
+        assert update["status"] == "success"
+        report = await call(client, "boss_export_filter_log", batch_id=batch)
+        contents = Path(report["path"]).read_text(encoding="utf-8")
+        assert "fixture-1 | 本轮返回，待人工复核 |  | 已核对详情 | 是 | 2 |" in contents
+        assert "人工复核：项目职责待面试确认" in contents
+
+
+@pytest.mark.asyncio
+async def test_filter_report_preserves_reasons_and_missing_evidence(app):
+    import csv
+
+    server, page = app["server"], app["page"]
+    frame = await (await server.get_scraper())._get_search_frame(page)
+    await frame.evaluate("""() => {
+        document.addEventListener('keydown', event => {
+            if (event.key !== 'Enter') return;
+            event.stopImmediatePropagation();
+            const cards = Array.from(document.querySelectorAll('li.geek-info-card a'));
+            cards[0].querySelectorAll('div')[2].nextElementSibling.textContent = '深圳';
+            cards[1].querySelectorAll('div')[2].nextElementSibling.textContent = '';
+            document.body.insertAdjacentHTML('beforeend', '<p>没有更多了</p>');
+        }, true);
+    }""")
+    async with Client(server.mcp) as client:
+        result = await call(client, "boss_search_candidates", keyword="=Python", city="厦门", count=2, scan_mode="end")
+        assert result[0]["entrypoint"] == "mcp"
+        assert result[0]["stop_reason"] == "end_of_list"
+        assert result[0]["new"] == 0
+        assert result[0]["cards_observed"] == 2
+        report = await call(client, "boss_export_filter_log", batch_id=result[0]["batch_id"], format="csv")
+        with Path(report["path"]).open(encoding="utf-8-sig", newline="") as source:
+            rows = list(csv.DictReader(source))
+        assert [row["本轮已核对详情"] for row in rows] == ["否", "否"]
+        assert rows[0]["卡片阶段结果"] == "卡片条件不符"
+        assert "深圳" in rows[0]["判断依据"]
+        assert rows[1]["卡片阶段结果"] == "卡片证据不足，待核实"
+        assert rows[0]["关键词"] == "'=Python"
+        assert rows[0]["扫描停止原因"] == "页面明确提示已到底"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_scrolls,reason,observed", [(1, "scroll_limit", 2), (8, "end_of_list", 4)])
+async def test_scan_visits_fixed_size_virtual_rows_until_limit_or_explicit_end(app, max_scrolls, reason, observed):
+    server, page = app["server"], app["page"]
+    frame = await (await server.get_scraper())._get_search_frame(page)
+    await frame.evaluate("""() => {
+        const list = document.querySelector('#results');
+        list.style = 'height:160px; overflow-y:auto';
+        const end = document.createElement('p');
+        document.addEventListener('keydown', event => {
+            if (event.key !== 'Enter') return;
+            event.stopImmediatePropagation();
+            list.querySelector('a').firstChild.textContent = '新搜索结果';
+        }, true);
+        list.addEventListener('scroll', () => {
+            if (list.scrollTop + list.clientHeight < list.scrollHeight - 2 || end.isConnected) return;
+            list.querySelectorAll('a').forEach((link, index) => link.dataset.expect = 'next-' + index);
+            end.textContent = '没有更多了';
+            document.body.append(end);
+        });
+    }""")
+    async with Client(server.mcp) as client:
+        result = await call(client, "boss_search_candidates", keyword="Python", count=1,
+                            scan_mode="end", max_scrolls=max_scrolls)
+        stats = result[0]
+        assert stats["stop_reason"] == reason, stats
+        assert stats["unique_candidates"] == observed
+        assert stats["new"] == 1
+        assert result[1]["index"] == (None if observed == 4 else 0)
+        report = await call(client, "boss_export_filter_log", batch_id=stats["batch_id"])
+        assert report["row_count"] == observed
+
+
+@pytest.mark.asyncio
+async def test_end_mode_distinguishes_no_new_cards_from_explicit_end(app):
+    async with Client(app["server"].mcp) as client:
+        results = await call(client, "boss_search_candidates", keyword="Python", count=1, scan_mode="end")
+    assert results[0]["stop_reason"] == "no_new_cards"
+    assert results[0]["status"] == "partial"
+    assert results[0]["unique_candidates"] == 2
 
 
 @pytest.mark.asyncio

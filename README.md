@@ -133,6 +133,7 @@ macOS 也提供三个可双击的入口：`open-boss.command` 打开浏览器，
 | `boss_update_candidate` | 更新本地备注、状态、分数、链接 |
 | `boss_filter_and_score` | 按显式条件过滤并进行岗位关键词匹配 |
 | `boss_export_report` | 返回含表格和可选详情的 Markdown 报告 |
+| `boss_export_filter_log` | 按搜索批次导出逐条过滤记录，支持 Markdown 和 CSV |
 | `boss_pipeline_status` | 查看统计与恢复建议 |
 | `boss_clear_dedup` | 按 ID、状态、日期清理记录；无参数清空当前数据库 |
 | `boss_greet_by_index` | 在当前搜索结果中发起沟通，可带自定义消息 |
@@ -152,9 +153,21 @@ macOS 也提供三个可双击的入口：`open-boss.command` 打开浏览器，
 {"index":0,"include_ocr":true}
 ```
 
-`count` 范围为 1–300。`city`、`experience`、`salary` 对已加载卡片进行本地过滤；它们不是对网站全部候选人的服务器筛选。例：`city="北京"`、`experience="3-5年"`、`salary="20-30K"`。缺少必要字段的卡片不会通过对应筛选，返回数量可能小于 `count`。
+`city`、`experience`、`salary` 对已读取的卡片进行本地比对。这里的 `experience` 指总工作年限。卡片缺值或无法解析时，报告标记为「证据不足，待核实」。
 
-搜索默认去重，因此重复搜索可能只返回 `_stats`，候选人仍保存在数据库中。查看简历使用的是页面原始索引，而非去重后列表的位置。
+搜索默认按符合卡片条件的人数停止。选择 `scan_mode="end"` 可以在同一查询中继续向下扫描；`count`（1–300）仍限制每个关键词的返回数量，`max_scrolls`（1–200，默认 40）和 90 秒扫描时限控制单次扫描。只有看到明确的页面结束提示才返回 `end_of_list`。连续无新增、达到上限、超时以及需要验证都有单独的停止原因。扫描过程中不会循环刷新页面。
+
+搜索按 ID 去重，统计包含已观察卡片、新增候选人和卡片处理结果。虚拟列表可能移走先前读到的卡片，此时返回的 `index` 为空。查看简历优先使用 `expectId`。按 ID 查看时会核对弹窗的候选人 ID，无法核对则返回明确状态。
+
+### 导出一次搜索的过滤记录
+
+1. 调用 `boss_search_candidates` 或 `boss_multi_search`，从首条统计中取 `batch_id`。只读卡片时，批量搜索传入 `auto_view=false`。
+2. 需要看详情时，调用 `boss_view_by_expect_id` 并传入该 `batch_id`。如需记录后续人工判断，调用 `boss_update_candidate`，同样传入批次 ID 及备注。
+3. 调用 `boss_export_filter_log`，指定同一 `batch_id` 和 `format="md"` 或 `"csv"`。工具在 `data/reports/` 下写入文件并返回路径，可在查看详情或填写备注后重新导出。
+
+报告包括批次来源、每个关键词的扫描停止原因、卡片条件与证据、详情状态和显式写入的复核备注。报告只覆盖本轮实际读取的卡片；关键词搜索与「推荐／精选」是不同的列表来源。
+
+在 WorkBuddy 会话中调用 `boss_pipeline_status`，若返回 `entrypoint: mcp` 和 `call_id`，可确认该会话发起的调用已到达服务端。`boss-local-mcp check` 测试本机 stdio 调用。服务端把调用时间、工具名、调用状态和关联批次保存在本地 `data/run-history.sqlite3`。
 
 ## 配置
 
@@ -199,7 +212,7 @@ uv run pytest -q
 uv build --wheel
 ```
 
-自动化测试启动独立的无界面 Chrome，访问本地模拟招聘页面，覆盖全部 17 个工具、消息发送结果、二维码、本地 OCR、并发操作、数据库和 stdio/HTTP 协议。不会在真实 BOSS 页面执行沟通操作。
+自动化测试启动独立的无界面 Chrome，访问本地模拟招聘页面，覆盖工具调用、扫描与报告、消息发送结果、二维码、本地 OCR、并发操作、数据库和 stdio/HTTP 协议。
 
 GitHub Actions 在 macOS 15 / Python 3.14、Windows / Python 3.14 和 Ubuntu / Python 3.12 上安装清单指定的项目浏览器，运行模拟页面测试及 wheel 构建。云端不使用真实账号。
 
@@ -229,10 +242,11 @@ scraper.py          搜索、简历、分享、沟通流程
 candidate_db.py     本地 JSON 数据库
 filters.py          已加载卡片的显式筛选
 ranking.py          岗位关键词匹配
+run_history.py      MCP 调用记录与筛选批次报告
 evaluator.py        传入简历与岗位要求的关键词评估
 ocr.py              本地 OCR 与可选云端接口
 qr.py               二维码解码及 zbar 路径适配
-server.py           17 个 MCP 工具
+server.py           18 个 MCP 工具
 cli.py              启动、浏览器、检查、自检命令
 boss_local_assets/  浏览器版本清单、Apple Vision OCR 源码
 tests/              本地模拟页面与回归测试

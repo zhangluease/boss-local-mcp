@@ -4,9 +4,13 @@ import sys
 import os
 import importlib
 import asyncio
+from collections import Counter
+from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
+from typing import Literal
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware
 import browser as browser_mod
 import scraper as scraper_mod
 import evaluator as evaluator_mod
@@ -15,7 +19,9 @@ from browser import BossBrowser
 from scraper import BossScraper
 from evaluator import CandidateEvaluator
 from candidate_db import CandidateDB
-from config import DEDUP_FILE, CANDIDATE_DB_FILE, PROFILE
+from config import DATA_DIR, DEDUP_FILE, CANDIDATE_DB_FILE, PROFILE
+from filters import card_filter
+from run_history import RunHistory, new_id, record_detail_attempt, timestamp
 
 mcp = FastMCP("boss-local-mcp")
 
@@ -28,6 +34,168 @@ _evaluator = CandidateEvaluator()
 
 _db = CandidateDB(CANDIDATE_DB_FILE, legacy_dedup_path=DEDUP_FILE)
 _browser_lock = asyncio.Lock()
+
+
+_history = RunHistory(DATA_DIR)
+_invocation = ContextVar("mcp_invocation", default=None)
+
+
+class InvocationHistory(Middleware):
+    async def on_call_tool(self, context, call_next):
+        if context.source != "client":
+            return await call_next(context)
+        call = {"call_id": new_id(), "batch_id": None}
+        _history.start_call(call["call_id"], context.message.name)
+        token = _invocation.set(call)
+        outcome = "failed"
+        try:
+            result = await call_next(context)
+            outcome = "returned"
+            return result
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            _invocation.reset(token)
+            _history.finish_call(call["call_id"], outcome, call["batch_id"])
+
+
+mcp.add_middleware(InvocationHistory())
+
+
+def _entrypoint():
+    return "mcp" if _invocation.get() else "direct"
+
+
+def _link_batch(batch_id):
+    invocation = _invocation.get()
+    if invocation is not None:
+        invocation["batch_id"] = batch_id
+
+
+def _start_batch(tool, auto_view):
+    batch = {
+        "batch_id": new_id(), "source": "keyword_search", "entrypoint": _entrypoint(),
+        "tool": tool, "started_at": timestamp(), "status": "running", "auto_view": auto_view,
+        "scans": [], "rows": [],
+    }
+    _link_batch(batch["batch_id"])
+    _history.save_batch(batch)
+    return batch
+
+
+def _detail_outcome(result):
+    identity = result.get("identity_check", "")
+    code = result.get("error_code", "")
+    if not result.get("error") and identity == "verified" and result.get("screenshots"):
+        return "opened", True, identity, ""
+    if code == "not_visible":
+        return "not_visible", False, identity, code
+    if code in ("identity_mismatch", "identity_unverified") or identity == "card_only":
+        return "identity_unverified", False, identity, code
+    return "failed", False, identity, code or "view_error"
+
+
+def _save_verified_detail(result):
+    if not result.get("error") and result.get("identity_check") == "verified":
+        expect_id = result["ids"]["expectId"]
+        candidate = _db.get(expect_id)
+        if candidate is None:
+            return
+        fields = {}
+        if candidate["status"] == "new":
+            fields["status"] = "viewed"
+        if result.get("share_url"):
+            fields["share_url"] = result["share_url"]
+        if fields:
+            _db.update(expect_id, **fields)
+
+
+async def _search_keyword(batch, keyword, city, experience, salary, count, scan_mode, max_scrolls):
+    filters = {"city": city, "experience": experience, "salary": salary}
+    scan = {
+        "order": len(batch["scans"]) + 1, "keyword": keyword, "filters": filters,
+        "scan_mode": scan_mode, "target_count": count,
+        "scroll_count": 0, "stop_reason": "search_error", "cards_observed": 0,
+        "unique_candidates": 0, "fetched": 0, "new": 0, "duplicates": 0,
+    }
+    batch["scans"].append(scan)
+    selected = []
+    verification = None
+    decisions = Counter()
+    try:
+        scraper = await get_scraper()
+        result = await scraper.scan_candidates(keyword, city, experience, salary, count, scan_mode, max_scrolls)
+        verification = result["verification"]
+        scan.update(scroll_count=result["scroll_count"], stop_reason=result["stop_reason"],
+                    cards_observed=len(result["rows"]))
+        if result.get("error"):
+            scan["error"] = result["error"]
+        for ordinal, observation in enumerate(result["rows"], 1):
+            card, reasons = observation["candidate"], observation["reasons"]
+            expect_id = card["expectId"]
+            if expect_id:
+                scan["unique_candidates"] += 1
+            if not expect_id:
+                disposition = "missing_id"
+            elif reasons:
+                disposition = "mismatch" if any(reason["result"] == "mismatch" for reason in reasons) else "insufficient_evidence"
+            elif scan["fetched"] >= count:
+                disposition = "result_limit"
+            else:
+                scan["fetched"] += 1
+                if _db.add(card, source_keyword=keyword):
+                    disposition = "selected"
+                    scan["new"] += 1
+                else:
+                    disposition = "duplicate"
+                    scan["duplicates"] += 1
+            decisions[disposition] += 1
+            row = {
+                "row_id": f"{scan['order']}.{ordinal}", "scan_order": scan["order"], "keyword": keyword,
+                "expect_id": expect_id, "disposition": disposition, "reasons": reasons,
+                "card_evidence": {field: card.get(field) or "" for field in ("expectCity", "experience", "salary")},
+                "detail_opened": False, "detail_attempts": [],
+                "detail_status": "not_attempted" if batch["auto_view"] and disposition == "selected" else "not_requested",
+            }
+            batch["rows"].append(row)
+            if disposition == "selected":
+                if batch["tool"] == "boss_multi_search":
+                    card["_source_keyword"] = keyword
+                selected.append((card, row))
+
+        if selected:
+            _db._save()
+        if batch["auto_view"]:
+            scan.update(viewed=0, view_failed=0, share_links=0)
+            _history.save_batch(batch)
+            for card, row in selected:
+                if verification:
+                    break
+                try:
+                    detail = await scraper.view_candidate_by_expect_id(card["expectId"])
+                except Exception:
+                    detail = {"error": "读取简历失败", "error_code": "view_error"}
+                outcome = _detail_outcome(detail)
+                record_detail_attempt(row, *outcome)
+                if outcome[1]:
+                    scan["viewed"] += 1
+                    _save_verified_detail(detail)
+                    if detail.get("share_url"):
+                        card["share_url"] = detail["share_url"]
+                        scan["share_links"] += 1
+                else:
+                    scan["view_failed"] += 1
+                    verification = await scraper.browser.check_and_screenshot_verification()
+                    if verification:
+                        scan["view_stop_reason"] = "verification"
+    except Exception as error:
+        scan["stop_reason"] = "search_error"
+        scan["error"] = str(error)
+    finally:
+        scan["card_outcomes"] = dict(decisions)
+        _history.save_batch(batch)
+    return scan, [card for card, _ in selected], verification
 
 
 def browser_operation(function):
@@ -116,214 +284,108 @@ async def boss_search_candidates(
     experience: str = "",
     salary: str = "",
     count: int = 30,
+    scan_mode: Literal["target", "end"] = "target",
+    max_scrolls: int = 40,
 ) -> list[dict]:
-    """在 BOSS 直聘「找人才」页面搜索候选人。
+    """关键词搜索。返回批次 ID、卡片统计和本轮新增候选人。
 
-    支持多次搜索自动去重：重复调用会刷新结果，只返回新候选人。
-    所有候选人数据自动持久化到本地数据库。
-
-    Args:
-        keyword: 搜索关键词，如 "产品经理"、"前端工程师"
-        city: 城市，如 "杭州"、"北京"（可选）
-        experience: 经验要求，如 "3-5年"（可选）
-        salary: 期望薪资范围（可选）
-        count: 期望获取数量，默认 30，传入更大值会自动滚动加载（如 100、200）
-
-    Returns:
-        候选人列表（已去重），附带 _stats 统计信息
+    target 模式达到 count 个可通过卡片过滤的候选人后停止。end 模式继续扫描当前列表，
+    直到页面明确结束、无新增、超时或达到 max_scrolls。count 始终限制返回数量。
+    experience 衡量卡片总工作年限。通过 boss_export_filter_log 导出本轮过滤记录。
     """
-    scraper = await get_scraper()
-    browser = await get_browser()
-
-    try:
-        all_candidates = await scraper.search_candidates(keyword, city, experience, salary, count)
-    except Exception as e:
-        # Check if it's a verification/CAPTCHA issue
-        verify = await browser.check_and_screenshot_verification()
-        if verify:
-            return [verify]
-        return [{"error": str(e), "message": "搜索失败，请检查浏览器状态"}]
-
-    # Check for error responses from scraper
-    if all_candidates and isinstance(all_candidates[0], dict) and all_candidates[0].get("error"):
-        verify = await browser.check_and_screenshot_verification()
-        if verify:
-            return [verify]
-        return all_candidates
-
-    new_candidates = []
-    for c in all_candidates:
-        eid = c.get("expectId", "")
-        if not eid or _db.has(eid):
-            continue
-        _db.add(c, source_keyword=keyword)
-        new_candidates.append(c)
-
-    if new_candidates:
-        _db._save()
-
-    stats = {
-        "_stats": True,
-        "total_fetched": len(all_candidates),
-        "new": len(new_candidates),
-        "duplicates": len(all_candidates) - len(new_candidates),
-        "cumulative_seen": _db.stats()["total"],
-        "filter_scope": "loaded_candidates" if city or experience or salary else "none",
-    }
-    return [stats] + new_candidates
+    return await _run_search("boss_search_candidates", [keyword], city, experience, salary,
+                             count, scan_mode, max_scrolls, auto_view=False)
 
 
 @mcp.tool()
 @browser_operation
 async def boss_multi_search(
-    keywords: list[str] = None,
+    keywords: list[str] | None = None,
     city: str = "",
     experience: str = "",
     count_per_keyword: int = 50,
     auto_view: bool = True,
+    scan_mode: Literal["target", "end"] = "target",
+    max_scrolls: int = 40,
+    salary: str = "",
 ) -> list[dict]:
-    """多关键词批量搜索候选人，自动去重，自动获取分享链接。
+    """按关键词顺序搜索，跨关键词去重，返回同一批次 ID 和每个关键词的停止原因。
 
-    按顺序执行多个关键词搜索，跨关键词去重，返回所有新候选人的合并结果。
-    如果不传 keywords 和 city，自动从 search_profile.yaml 配置文件读取。
-    所有候选人数据自动持久化到本地数据库。
-
-    当 auto_view=True 时，每个关键词搜索后会自动对所有新候选人执行 view_by_index
-    获取 share_url（zpurl.cn 永久链接），确保切换关键词前链接已保存。
-
-    Args:
-        keywords: 搜索关键词列表（可选，默认从配置文件读取）
-        city: 城市，所有搜索共用（可选，默认从配置文件读取）
-        experience: 经验要求，所有搜索共用（可选）
-        count_per_keyword: 每个关键词期望获取数量，默认 50
-        auto_view: 搜索时自动获取所有新候选人的分享链接，默认 True
-
-    Returns:
-        统一结果列表：[总stats, 分词stats..., 候选人...]
+    auto_view=True 时，按候选人 ID 查看本轮新增卡片并核对简历身份。
+    如只需卡片预筛，传入 auto_view=False。用 boss_export_filter_log 导出过滤记录。
     """
-    import logging
-    log = logging.getLogger("boss-server")
-
-    # Defaults from profile
     if keywords is None:
         keywords = PROFILE.get("keywords", [])
-    if not keywords or not all(isinstance(keyword, str) and keyword.strip() for keyword in keywords):
-        raise ValueError("请提供非空 keywords，或先在 search_profile.yaml 中配置关键词")
-    if not 1 <= count_per_keyword <= 300:
-        raise ValueError("count_per_keyword 必须在 1 到 300 之间")
     if not city:
         city = PROFILE.get("job", {}).get("city", "")
+    return await _run_search("boss_multi_search", keywords, city, experience, salary,
+                             count_per_keyword, scan_mode, max_scrolls, auto_view)
 
+
+async def _run_search(tool, keywords, city, experience, salary, count, scan_mode, max_scrolls, auto_view):
+    if not keywords or not all(isinstance(keyword, str) and keyword.strip() for keyword in keywords):
+        raise ValueError("请提供非空关键词，或在 search_profile.yaml 中配置关键词")
+    if not 1 <= count <= 300 or not 1 <= max_scrolls <= 200:
+        raise ValueError("目标数量须在 1 到 300 之间，max_scrolls 须在 1 到 200 之间")
+    card_filter(city, experience, salary)
+
+    batch = _start_batch(tool, auto_view)
     initial_total = _db.stats()["total"]
-    scraper = await get_scraper()
-    all_new_candidates = []
-    per_keyword_stats = []
-    failures = []
+    candidates = []
+    verification = None
+    batch["status"] = "interrupted"
+    try:
+        for keyword in keywords:
+            _, found, verification = await _search_keyword(
+                batch, keyword, city, experience, salary, count, scan_mode, max_scrolls
+            )
+            candidates.extend(found)
+            if verification:
+                break
+        complete = {"target_reached", "end_of_list", "empty_results"}
+        all_scans_finished = all(scan["stop_reason"] in complete for scan in batch["scans"])
+        has_view_failure = any(scan.get("view_failed") for scan in batch["scans"])
+        batch["status"] = "complete" if all_scans_finished and not has_view_failure else "partial"
+    finally:
+        batch["finished_at"] = timestamp()
+        _history.save_batch(batch)
 
-    browser = await get_browser()
-
-    for i, kw in enumerate(keywords):
-        try:
-            raw = await scraper.search_candidates(kw, city, experience, "", count_per_keyword)
-        except Exception as e:
-            # Check for verification CAPTCHA
-            verify = await browser.check_and_screenshot_verification()
-            if verify:
-                # Return partial results + verification notice
-                verify["_partial"] = True
-                verify["completed_keywords"] = i
-                return [verify] + per_keyword_stats + all_new_candidates
-            log.warning(f"search '{kw}' failed: {e}")
-            failures.append({"keyword": kw, "message": str(e)})
-            continue
-
-        # Check for error responses
-        if raw and isinstance(raw[0], dict) and raw[0].get("error"):
-            verify = await browser.check_and_screenshot_verification()
-            if verify:
-                verify["_partial"] = True
-                verify["completed_keywords"] = i
-                return [verify] + per_keyword_stats + all_new_candidates
-            log.warning(f"search '{kw}' returned error: {raw[0].get('error')}")
-            failures.append({"keyword": kw, "message": raw[0]["error"]})
-            continue
-
-        new_for_kw = []
-        for c in raw:
-            eid = c.get("expectId", "")
-            if not eid or _db.has(eid):
-                continue
-            _db.add(c, source_keyword=kw)
-            c["_source_keyword"] = kw
-            new_for_kw.append(c)
-
-        # Auto-view: get share_url for ALL new candidates before switching keyword
-        viewed = 0
-        view_failed = 0
-        if auto_view and new_for_kw:
-            for c in new_for_kw:
-                idx = c.get("index")
-                if idx is None:
-                    continue
-                try:
-                    result = await scraper.view_candidate_by_index(idx)
-                    if result.get("error"):
-                        view_failed += 1
-                        continue
-                    share_url = result.get("share_url", "")
-                    eid = c.get("expectId", "")
-                    if eid and share_url:
-                        _db.update(eid, share_url=share_url)
-                        c["share_url"] = share_url
-                    viewed += 1
-                except Exception as e:
-                    view_failed += 1
-                    log.warning(f"view_by_index({idx}) failed for {c.get('name', '?')}: {e}")
-                    # Check for verification on view failure
-                    verify = await browser.check_and_screenshot_verification()
-                    if verify:
-                        verify["_partial"] = True
-                        verify["completed_keywords"] = i + 1
-                        verify["viewed_before_stop"] = viewed
-                        _db._save()
-                        return [verify] + per_keyword_stats + all_new_candidates
-
-        kw_stat = {
-            "_keyword_stats": True,
-            "keyword": kw,
-            "order": i + 1,
-            "fetched": len(raw),
-            "new": len(new_for_kw),
-            "duplicates": len(raw) - len(new_for_kw),
-        }
-        if auto_view:
-            kw_stat["viewed"] = viewed
-            kw_stat["view_failed"] = view_failed
-            kw_stat["share_links"] = sum(bool(candidate.get("share_url")) for candidate in new_for_kw)
-        per_keyword_stats.append(kw_stat)
-        all_new_candidates.extend(new_for_kw)
-
-        # Save after each keyword to avoid data loss on interruption
-        if new_for_kw:
-            _db._save()
-
-    current_total = _db.stats()["total"]
-    summary = {
-        "_stats": True,
-        "_multi_search": True,
-        "errors": failures,
-        "keywords_count": len(keywords),
-        "total_new": len(all_new_candidates),
-        "total_fetched": sum(s["fetched"] for s in per_keyword_stats),
-        "total_duplicates": sum(s["duplicates"] for s in per_keyword_stats),
-        "cumulative_seen": current_total,
-        "new_this_session": current_total - initial_total,
+    scans = batch["scans"]
+    meta = {
+        "_stats": True, "batch_id": batch["batch_id"], "entrypoint": batch["entrypoint"],
+        "source": batch["source"], "status": batch["status"], "cumulative_seen": _db.stats()["total"],
     }
-    if auto_view:
-        summary["total_viewed"] = sum(s.get("viewed", 0) for s in per_keyword_stats)
-        summary["total_view_failed"] = sum(s.get("view_failed", 0) for s in per_keyword_stats)
+    if verification:
+        meta.update(verification, _partial=True, completed_keywords=len(scans) - 1)
+    if tool == "boss_search_candidates":
+        scan = scans[0]
+        meta.update(scan, total_fetched=scan["fetched"],
+                    filter_scope="loaded_candidates" if city or experience or salary else "none")
+        if scan["stop_reason"] in ("search_error", "search_timeout") and not scan["cards_observed"]:
+            meta["error"] = scan.get("error") or "等待新搜索结果超时"
+        return [meta, *candidates]
 
-    return [summary] + per_keyword_stats + all_new_candidates
+    per_keyword = [{"_keyword_stats": True, **scan} for scan in scans]
+    meta.update({
+        "_multi_search": True, "keywords_count": len(keywords),
+        "total_new": len(candidates), "total_fetched": sum(scan["fetched"] for scan in scans),
+        "total_duplicates": sum(scan["duplicates"] for scan in scans),
+        "new_this_session": _db.stats()["total"] - initial_total,
+        "errors": [{"keyword": scan["keyword"], "message": scan.get("error") or "等待新搜索结果超时"}
+                   for scan in scans if scan["stop_reason"] in ("search_error", "search_timeout")],
+    })
+    if auto_view:
+        meta["total_viewed"] = sum(scan.get("viewed", 0) for scan in scans)
+        meta["total_view_failed"] = sum(scan.get("view_failed", 0) for scan in scans)
+    return [meta, *per_keyword, *candidates]
+
+
+@mcp.tool()
+async def boss_export_filter_log(batch_id: str, format: Literal["md", "csv"] = "md") -> dict:
+    """导出本次关键词搜索中实际读到的卡片和详情查看记录。返回本地文件路径。"""
+    report = _history.export(batch_id, format)
+    _link_batch(batch_id)
+    return report
 
 
 @mcp.tool()
@@ -379,7 +441,8 @@ async def boss_view_candidate(profile_url: str) -> dict:
         visible = await scraper.get_visible_expect_ids()
         for candidate in matches:
             if candidate["expectId"] in visible:
-                result = await scraper.view_candidate_by_index(visible.index(candidate["expectId"]))
+                result = await scraper.view_candidate_by_expect_id(candidate["expectId"])
+                _save_verified_detail(result)
                 return {"profile_url": profile_url, **result}
     return await scraper.view_candidate(profile_url)
 
@@ -401,51 +464,34 @@ async def boss_view_by_index(index: int, include_ocr: bool = False) -> dict:
     scraper = await get_scraper()
     result = await scraper.view_candidate_by_index(index)
 
-    # Auto-save share_url to database
-    share_url = result.get("share_url", "")
-    ids = result.get("ids", {})
-    expect_id = ids.get("expectId", "")
-    if expect_id and share_url:
-        _db.update(expect_id, share_url=share_url, status="viewed")
-    elif expect_id:
-        _db.update(expect_id, status="viewed")
-
-    return await add_local_ocr(result) if include_ocr else result
+    _save_verified_detail(result)
+    return await add_local_ocr(result) if include_ocr and not result.get("error") else result
 
 
 @mcp.tool()
 @browser_operation
-async def boss_view_by_expect_id(expect_id: str, include_ocr: bool = False) -> dict:
-    """通过 expectId 在当前搜索页面查找候选人并查看简历。
+async def boss_view_by_expect_id(expect_id: str, include_ocr: bool = False, batch_id: str = "") -> dict:
+    """按当前列表卡片的 expectId 打开并核对简历，可选 OCR。
 
-    自动在当前页面的候选人卡片中查找匹配的 expectId，
-    找到后点击查看简历并提取分享链接。
-
-    Args:
-        expect_id: 候选人的 expectId
-
-    Returns:
-        候选人简历截图路径 + 分享链接，或错误信息
+    使用搜索返回的 batch_id 可将此次查看结果写入该批次的过滤报告。
     """
-    scraper = await get_scraper()
-    visible = await scraper.get_visible_expect_ids()
-    if expect_id not in visible:
-        return {
-            "error": f"候选人 {expect_id} 不在当前搜索页面上（共 {len(visible)} 张卡片）",
-            "visible_count": len(visible),
-        }
-    index = visible.index(expect_id)
-    result = await scraper.view_candidate_by_index(index)
+    expect_id = expect_id.strip()
+    if batch_id:
+        if not _history.candidate_in_batch(batch_id, expect_id):
+            return {"error": "该候选人 ID 不在指定批次中"}
+        _link_batch(batch_id)
+    try:
+        scraper = await get_scraper()
+        result = await scraper.view_candidate_by_expect_id(expect_id)
+    except Exception:
+        if batch_id:
+            _history.record_detail(batch_id, expect_id, "failed", False, code="view_error")
+        raise
 
-    share_url = result.get("share_url", "")
-    ids = result.get("ids", {})
-    eid = ids.get("expectId", expect_id)
-    if eid and share_url:
-        _db.update(eid, share_url=share_url, status="viewed")
-    elif eid:
-        _db.update(eid, status="viewed")
-
-    return await add_local_ocr(result) if include_ocr else result
+    if batch_id:
+        _history.record_detail(batch_id, expect_id, *_detail_outcome(result))
+    _save_verified_detail(result)
+    return await add_local_ocr(result) if include_ocr and not result.get("error") else result
 
 
 @mcp.tool()
@@ -551,6 +597,7 @@ async def boss_update_candidate(
     score: int | None = None,
     notes: str = "",
     share_url: str = "",
+    batch_id: str = "",
 ) -> dict:
     """更新候选人状态、评分或备注。
 
@@ -562,6 +609,7 @@ async def boss_update_candidate(
         score: 匹配度评分（0-100）
         notes: 备注信息
         share_url: 分享链接
+        batch_id: 可选。将显式提供的状态、分数或备注写入指定批次的复核记录。
 
     Returns:
         更新结果
@@ -584,7 +632,13 @@ async def boss_update_candidate(
     if not fields:
         return {"status": "error", "message": "没有需要更新的字段"}
 
+    if batch_id and not _history.candidate_in_batch(batch_id, expect_id):
+        return {"status": "error", "message": "该候选人 ID 不在指定批次中"}
     if _db.update(expect_id, **fields):
+        if batch_id:
+            _link_batch(batch_id)
+            if status or score is not None or notes:
+                _history.record_follow_up(batch_id, expect_id, status, score, notes)
         return {"status": "success", "expect_id": expect_id, "updated": fields}
     return {"status": "error", "message": f"未找到候选人 {expect_id}"}
 
@@ -615,6 +669,8 @@ async def boss_pipeline_status() -> dict:
 
     return {
         **s,
+        "entrypoint": _entrypoint(),
+        "call_id": _invocation.get()["call_id"] if _invocation.get() else None,
         "suggestions": suggestions,
     }
 

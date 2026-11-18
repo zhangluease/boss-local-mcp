@@ -28,9 +28,14 @@ async def check():
     transport = StdioTransport(command=sys.executable, args=[str(Path(__file__).with_name("server.py"))])
     async with Client(transport, timeout=45) as client:
         tools = await client.list_tools()
-        for name in ("boss_pipeline_status", "boss_query_db"):
-            await client.call_tool(name, {})
-        print(json.dumps({"status": "ok", "tool_count": len(tools), "tools": sorted(tool.name for tool in tools)}, ensure_ascii=False, indent=2))
+        status = await client.call_tool("boss_pipeline_status", {})
+        if status.is_error or status.data.get("entrypoint") != "mcp" or not status.data.get("call_id"):
+            raise RuntimeError("本地 MCP 自检未能验证工具调用")
+        database = await client.call_tool("boss_query_db", {})
+        if database.is_error:
+            raise RuntimeError("本地 MCP 数据库自检失败")
+        print(json.dumps({"status": "ok", "probe": "local_stdio", "call_id": status.data["call_id"],
+                          "tool_count": len(tools), "tools": sorted(tool.name for tool in tools)}, ensure_ascii=False, indent=2))
 
 
 def doctor():

@@ -34,7 +34,7 @@ async def run(arguments):
             print(name + ": passed", flush=True)
             return data
 
-        assert len(await client.list_tools()) == 17
+        assert "boss_export_filter_log" in {tool.name for tool in await client.list_tools()}
         login = await call("boss_login")
         if login.get("status") != "success":
             raise RuntimeError("请先手动登录招聘者账号")

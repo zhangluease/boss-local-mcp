@@ -6,11 +6,12 @@ import functools
 import logging
 import os
 import tempfile
+import time
 import uuid
 from urllib.parse import urlsplit
 from browser import BossBrowser
 from config import BOSS_BASE_URL
-from filters import filter_loaded_candidates
+from filters import card_filter
 
 from qr import HAS_QR_DECODER, decode_image
 
@@ -98,14 +99,9 @@ EXTRACT_CARDS_JS = """() => {
         const skillEls = card.querySelectorAll(".rcd-tags span, .tag-item, [class*='tag']");
         const skills = Array.from(skillEls).map(el => el.innerText.trim()).filter(s => s.length > 0 && s.length < 20);
 
-        let expectCity = "";
-        const cityIdx = lines.findIndex(l => l === "期望城市");
-        if (cityIdx >= 0 && lines[cityIdx + 1]) expectCity = lines[cityIdx + 1];
-        // Also check "期望" line
-        if (!expectCity) {
-            const expIdx = lines.findIndex(l => l === "期望");
-            if (expIdx >= 0 && lines[expIdx + 1]) expectCity = lines[expIdx + 1];
-        }
+        const cityIdx = lines.findIndex(l => l === "期望城市" || l === "期望");
+        const cityText = cityIdx < 0 ? "" : (lines[cityIdx + 1] || "");
+        const expectCity = ["期望城市", "期望", "职位", "院校"].includes(cityText) ? "" : cityText;
 
         let company = "", title = "";
         const posIdx = lines.findIndex(l => l === "职位");
@@ -135,6 +131,50 @@ EXTRACT_CARDS_JS = """() => {
     }
     return results;
 }"""
+
+
+SEARCH_SNAPSHOT_JS = """() => {
+    const markers = Array.from(document.querySelectorAll('p, span, div')).filter(el =>
+        !el.childElementCount && !el.closest('li.geek-info-card') && el.getClientRects().length &&
+        getComputedStyle(el).visibility === 'visible');
+    const labels = markers.map(el => el.innerText.trim());
+    return {
+        cards: (""" + EXTRACT_CARDS_JS + """)(),
+        end: labels.some(line => /^(没有更多(?:了|人才|候选人|数据)?|已(?:经)?到底了|到底了|已加载全部)(?:[~～。!！])?$/.test(line)),
+        empty: labels.some(line => /^(暂无(?:相关)?(?:结果|搜索结果|候选人|人才)|未找到(?:相关)?(?:候选人|人才))$/.test(line))
+    };
+}"""
+
+SCROLL_SEARCH_JS = """reset => {
+    const card = document.querySelector('li.geek-info-card');
+    let container = card?.parentElement;
+    while (container && container !== document.scrollingElement) {
+        const overflow = getComputedStyle(container).overflowY;
+        if (/auto|scroll|overlay/.test(overflow) && container.scrollHeight > container.clientHeight) break;
+        container = container.parentElement;
+    }
+    container ||= document.scrollingElement;
+    if (!container) return true;
+    if (reset) {
+        const moved = container.scrollTop > 0;
+        container.scrollTop = 0;
+        return moved;
+    }
+    const next = container.scrollTop + Math.max(1, Math.floor(container.clientHeight * 0.85));
+    const last = container.scrollHeight - container.clientHeight;
+    container.scrollTop = Math.min(next, last);
+    return next >= last - 2;
+}"""
+
+
+def _enrich_card(card, api_cards):
+    candidate = card.copy()
+    api = api_cards.get(candidate["expectId"], {})
+    if not candidate["salary"] and api.get("salaryDesc"):
+        candidate["salary"] = api["salaryDesc"]
+    if api.get("encryptGeekId"):
+        candidate["geekId"] = api["encryptGeekId"]
+    return candidate
 
 
 class BossScraper:
@@ -230,125 +270,161 @@ class BossScraper:
         salary: str = "",
         count: int = 30,
     ) -> list[dict]:
-        """Search candidates via the BOSS SPA search iframe.
+        """Return the legacy filtered card list to direct Python callers."""
+        result = await self.scan_candidates(keyword, city, experience, salary, count)
+        if result["stop_reason"] in ("search_error", "search_timeout") and not result["rows"]:
+            return [{"error": result.get("error") or "等待新搜索结果超时"}]
+        return [row["candidate"] for row in result["rows"] if not row["reasons"]][:count]
 
-        Args:
-            keyword: 搜索关键词
-            city: 城市（可选）
-            experience: 经验要求（可选）
-            salary: 薪资范围（可选）
-            count: 期望获取的候选人数量，默认 30，最大约 300
-
-        Returns:
-            候选人列表
-        """
-        p = self.browser.page
-        if not isinstance(count, int) or not 1 <= count <= 300:
-            raise ValueError("count 必须在 1 到 300 之间")
+    async def scan_candidates(
+        self,
+        keyword: str,
+        city: str = "",
+        experience: str = "",
+        salary: str = "",
+        count: int = 30,
+        scan_mode: str = "target",
+        max_scrolls: int = 40,
+    ) -> dict:
+        """Return observed cards and why this keyword scan stopped."""
+        evaluate = card_filter(city, experience, salary)
         if not keyword.strip():
             raise ValueError("搜索关键词不能为空")
+        if not 1 <= count <= 300 or not 1 <= max_scrolls <= 200:
+            raise ValueError("count 必须在 1 到 300 之间，max_scrolls 必须在 1 到 200 之间")
+        if scan_mode not in ("target", "end"):
+            raise ValueError("scan_mode 必须是 target 或 end")
+
+        p = self.browser.page
         await self._cleanup_dialogs()
         frame = await self._get_search_frame(p)
-        if not frame:
-            return [{"error": "无法找到搜索 iframe"}]
+        search_input = await frame.wait_for_selector("input.search-input")
+        api_cards = {}
+        response_seen = asyncio.Event()
 
-        search_input = await frame.query_selector("input.search-input")
-        if not search_input:
-            return [{"error": "无法找到搜索输入框"}]
-
-        # Set up network interception to capture API data
-        api_candidates = []
-
-        async def _capture_api(response):
+        async def capture(response):
+            url = response.url
+            if not ("geeks.json" in url or "searchGeek" in url or ("zpgeek" in url and "search" in url)):
+                return
             try:
-                url = response.url
-                if ("geeks.json" in url or "searchGeek" in url
-                        or ("zpgeek" in url and "search" in url)):
-                    data = await response.json()
-                    if isinstance(data, dict):
-                        geek_list = data.get("zpData", {}).get("geekList", [])
-                        if not geek_list:
-                            geek_list = data.get("data", {}).get("list", [])
-                        api_candidates.extend(geek_list)
-            except Exception:
-                pass
+                data = await response.json()
+                candidates = data.get("zpData", {}).get("geekList", []) or data.get("data", {}).get("list", [])
+                for card in candidates:
+                    identifier = card.get("expectId") or card.get("encryptExpectId")
+                    if identifier:
+                        api_cards[str(identifier)] = card
+                response_seen.set()
+            except (AttributeError, TypeError, ValueError, RuntimeError, TimeoutError):
+                log.debug("Search response data was unavailable")
 
-        p.on("response", _capture_api)
-
-        # Clear and type keyword
-        await search_input.click()
-        await search_input.fill("")
-        await search_input.type(keyword, delay=80)
-        await _wait(0.5)
-
-        await search_input.press("Enter")
-        await _wait(3)
-
+        observed = {}
+        current = []
+        rounds = 0
+        stall = 0
+        verification = None
+        error = None
+        stop_reason = "search_timeout"
+        p.on("response", capture)
         try:
-            await frame.wait_for_selector("li.geek-info-card", timeout=10000)
-        except Exception:
-            p.remove_listener("response", _capture_api)
-            return [{"error": "搜索超时，未找到候选人卡片"}]
-
-        await self.browser.random_delay()
-
-        # Scroll to load more candidates if count > 30
-        if count > 30:
-            loaded = await frame.evaluate('document.querySelectorAll("li.geek-info-card").length')
-            max_rounds = min((count - loaded) // 14 + 2, 25)  # cap at ~375 cards
-            for _ in range(max_rounds):
-                if loaded >= count:
+            # A fresh response or a change to the result DOM anchors the scan to
+            # this search. Do not attribute an unchanged old list to a new query.
+            await search_input.click()
+            await search_input.fill("")
+            await search_input.type(keyword, delay=80)
+            await _wait(0.5)
+            before = await frame.evaluate(SEARCH_SNAPSHOT_JS)
+            response_seen.clear()
+            await search_input.press("Enter")
+            await _wait(3)
+            initial_deadline = time.monotonic() + 10
+            while True:
+                snapshot = await frame.evaluate(SEARCH_SNAPSHOT_JS)
+                if (snapshot["cards"] or snapshot["empty"]) and (
+                    response_seen.is_set() or snapshot != before
+                ):
                     break
-                await frame.evaluate(
-                    'document.documentElement.scrollTop = document.documentElement.scrollHeight'
-                )
-                await _wait(2)
-                new_loaded = await frame.evaluate(
-                    'document.querySelectorAll("li.geek-info-card").length'
-                )
-                if new_loaded == loaded:
-                    break  # no more to load
-                loaded = new_loaded
+                verification = await self.browser.check_and_screenshot_verification()
+                if verification or time.monotonic() >= initial_deadline:
+                    return {"rows": [], "scroll_count": 0, "stop_reason": "verification" if verification else stop_reason,
+                            "verification": verification}
 
-        # Stop network interception
-        p.remove_listener("response", _capture_api)
+            deadline = time.monotonic() + 90
+            if snapshot["cards"] and await frame.evaluate(SCROLL_SEARCH_JS, True):
+                await _wait(0.6)
+                snapshot = await frame.evaluate(SEARCH_SNAPSHOT_JS)
+            at_bottom = False
+            while True:
+                current = snapshot["cards"]
+                prior = len(observed)
+                for card in current:
+                    identifier = (card.get("expectId") or "").strip()
+                    card["expectId"] = identifier
+                    # Missing IDs identify observations, not unique people.
+                    key = identifier if identifier else (card["index"], card["fullText"])
+                    observed[key] = card
+                verification = await self.browser.check_and_screenshot_verification()
+                if verification:
+                    stop_reason = "verification"
+                    break
+                if snapshot["empty"] and not current:
+                    stop_reason = "empty_results" if not observed else "list_unavailable"
+                    break
+                if snapshot["end"]:
+                    stop_reason = "end_of_list"
+                    break
 
-        # Extract candidate cards from DOM
-        candidates = await frame.evaluate(EXTRACT_CARDS_JS)
+                if scan_mode == "target":
+                    eligible = sum(
+                        bool(card["expectId"]) and not evaluate(_enrich_card(card, api_cards))
+                        for card in observed.values()
+                    )
+                    if eligible >= count:
+                        stop_reason = "target_reached"
+                        break
+                if time.monotonic() >= deadline:
+                    stop_reason = "scan_timeout"
+                    break
+                if rounds and at_bottom and len(observed) == prior:
+                    stall += 1
+                else:
+                    stall = 0
+                if stall >= 3:
+                    stop_reason = "no_new_cards"
+                    break
+                if rounds >= max_scrolls:
+                    stop_reason = "scroll_limit"
+                    break
 
-        # Enrich DOM candidates with API data if available
-        if api_candidates:
-            api_by_expect = {}
-            for ac in api_candidates:
-                eid = str(ac.get("expectId", ac.get("encryptExpectId", "")))
-                if eid:
-                    api_by_expect[eid] = ac
-            for c in candidates:
-                api = api_by_expect.get(c.get("expectId", ""))
-                if api:
-                    # Merge richer API fields (only if missing from DOM parse)
-                    if not c.get("salary") and api.get("salaryDesc"):
-                        c["salary"] = api["salaryDesc"]
-                    if api.get("geekName"):
-                        c["_apiName"] = api["geekName"]
-                    if api.get("encryptGeekId"):
-                        c["geekId"] = api["encryptGeekId"]
+                at_bottom = await frame.evaluate(SCROLL_SEARCH_JS)
+                rounds += 1
+                await _wait(2 if at_bottom else 0.6)
+                snapshot = await frame.evaluate(SEARCH_SNAPSHOT_JS)
+        except Exception as failure:
+            stop_reason, error = "search_error", str(failure)
+        finally:
+            p.remove_listener("response", capture)
 
-        return filter_loaded_candidates(candidates, city, experience, salary)[:count]
+        current_indexes = {card["expectId"]: card["index"] for card in current if card.get("expectId")}
+        rows = []
+        for card in observed.values():
+            candidate = _enrich_card(card, api_cards)
+            candidate["index"] = current_indexes.get(candidate["expectId"])
+            rows.append({"candidate": candidate, "reasons": evaluate(candidate)})
+        return {"rows": rows, "scroll_count": rounds, "stop_reason": stop_reason,
+                "verification": verification, "error": error}
 
     async def view_candidate_by_index(self, index: int) -> dict:
-        """Click the Nth candidate card, screenshot the resume canvas, OCR to extract text.
-
-        Args:
-            index: 0-based index of the candidate card to click
-
-        Returns:
-            Detailed resume data with OCR text
-        """
-        p = self.browser.page
         if not isinstance(index, int) or index < 0:
             return {"error": "索引必须是非负整数"}
+        return await self._view_card(index=index)
 
+    async def view_candidate_by_expect_id(self, expect_id: str) -> dict:
+        if not expect_id.strip():
+            return {"error": "expect_id 不能为空", "error_code": "missing_id"}
+        return await self._view_card(expect_id=expect_id.strip())
+
+    async def _view_card(self, *, index=None, expect_id=None):
+        p = self.browser.page
         # Close any existing dialog FIRST
         await self._cleanup_dialogs()
 
@@ -364,29 +440,58 @@ class BossScraper:
         if not frame:
             return {"error": "搜索 iframe 不可用，请先执行搜索"}
 
-        card_ids = await frame.evaluate(f"""() => {{
-            const card=document.querySelectorAll('li.geek-info-card a[data-contact]')[{index}];
-            return card ? {{expectId:card.getAttribute('data-expect')||'',jid:card.getAttribute('data-jid')||''}} : {{}};
-        }}""")
-        # Click the candidate card by index
-        clicked = await frame.evaluate(f"""() => {{
-            const cards = document.querySelectorAll("li.geek-info-card a[data-contact]");
-            if ({index} >= cards.length) return false;
-            cards[{index}].click();
-            return true;
-        }}""")
-
-        if not clicked:
-            return {"error": f"索引 {index} 超出范围"}
+        # Select and click in the same DOM operation. Virtualized rows can be
+        # replaced between two separate protocol calls.
+        clicked = await frame.evaluate("""({index, expectId}) => {
+            const cards = Array.from(document.querySelectorAll('li.geek-info-card'));
+            const links = cards.map(card => card.querySelector('a[data-contact]'));
+            const matches = expectId === null ? [links[index]].filter(Boolean) :
+                links.filter(link => link?.getAttribute('data-expect') === expectId);
+            if (matches.length !== 1) return {count: matches.length};
+            const card = matches[0];
+            const ids = {expectId: card.getAttribute('data-expect') || '', jid: card.getAttribute('data-jid') || ''};
+            card.click();
+            return {index: links.indexOf(card), ids};
+        }""", {"index": index, "expectId": expect_id})
+        if "ids" not in clicked:
+            if clicked["count"] > 1:
+                return {"error": "当前列表存在多个相同 ID，无法确定目标简历", "error_code": "ambiguous_id"}
+            if expect_id is not None:
+                return {"error": "候选人卡片不在当前列表中", "error_code": "not_visible"}
+            return {"error": f"索引 {index} 没有可查看的候选人卡片", "error_code": "not_visible"}
+        index = clicked["index"]
+        card_ids = clicked["ids"]
 
         await _wait(3)
 
-        # Find the resume dialog on parent page
-        dialog = await p.query_selector("div.boss-dialog__body")
-        if not dialog:
-            dialog = await p.query_selector("div.dialog-wrap.active")
-        if not dialog:
-            return {"error": "未找到简历弹窗"}
+        try:
+            dialog = await p.wait_for_selector("div.boss-dialog__body, div.dialog-wrap.active", timeout=4000)
+        except TimeoutError:
+            return {"error": "未找到简历弹窗", "error_code": "dialog_missing"}
+
+        # Read identity from this dialog, never from an unrelated element on
+        # the page. A mismatched dialog is closed before capture/export.
+        ids = await dialog._call("""function() {
+            const selector = '[data-expectid], [data-geekid]';
+            const el = this.querySelector('[data-expectid]') ||
+                (this.matches(selector) ? this : this.querySelector(selector));
+            if (!el) return {};
+            return {
+                geekId: el.getAttribute('data-geekid') || '',
+                encryptUserId: el.getAttribute('data-encryptuserid') || '',
+                expectId: el.getAttribute('data-expectid') || '',
+                jid: el.getAttribute('data-jid') || ''
+            };
+        }""")
+        expected = card_ids["expectId"]
+        actual = ids.get("expectId", "")
+        if expected and actual and expected != actual:
+            await self._cleanup_dialogs()
+            return {"error": "简历弹窗 ID 与目标卡片不一致", "error_code": "identity_mismatch"}
+        identity = "verified" if expected and actual == expected else "card_only" if expected else "unavailable"
+        if expect_id is not None and identity != "verified":
+            await self._cleanup_dialogs()
+            return {"error": "简历弹窗未提供可核对的候选人 ID", "error_code": "identity_unverified"}
 
         # Screenshot the dialog (captures the canvas-rendered resume)
         screenshot = await dialog.screenshot()
@@ -433,19 +538,6 @@ class BossScraper:
                         if (canvas) canvas.style.transform = 'translateY(0px)';
                     }""")
 
-        # Extract geekId and other identifiers from dialog
-        ids = await p.evaluate("""() => {
-            const el = document.querySelector('[data-geekid]');
-            if (!el) return {};
-            return {
-                geekId: el.getAttribute('data-geekid') || '',
-                encryptUserId: el.getAttribute('data-encryptuserid') || '',
-                expectId: el.getAttribute('data-expectid') || '',
-                securityId: (el.getAttribute('data-securityid') || '').slice(0, 50) + '...',
-                jid: el.getAttribute('data-jid') || '',
-            };
-        }""")
-
         ids = {**card_ids, **{key: value for key, value in ids.items() if value}}
         # Save screenshots to temp files
         paths = []
@@ -471,6 +563,7 @@ class BossScraper:
 
         return {
             "screenshots": paths,
+            "identity_check": identity,
             "ids": ids,
             "share_url": share_url,
             "share_card": share_card_path,

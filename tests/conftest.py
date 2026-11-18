@@ -66,7 +66,17 @@ def fixture_site():
 
 @pytest.fixture(scope="session")
 def chrome_endpoint(tmp_path_factory):
-    executable = os.getenv("BOSS_TEST_CHROME_PATH") or shutil.which("google-chrome") or shutil.which("chromium")
+    from browser_install import BrowserInstallError, managed_executable
+
+    executable = os.getenv("BOSS_TEST_CHROME_PATH")
+    if not executable:
+        try:
+            pinned = managed_executable()
+        except BrowserInstallError:
+            pinned = None
+        if pinned and pinned.is_file():
+            executable = str(pinned)
+    executable = executable or shutil.which("google-chrome") or shutil.which("chromium")
     if not executable and Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome").is_file():
         executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     if not executable:
@@ -113,6 +123,7 @@ async def app(chrome_endpoint, fixture_site, tmp_path, monkeypatch):
     from browser import BossBrowser
     from candidate_db import CandidateDB
     from cdp import CDPConnection
+    from run_history import RunHistory
 
     connection = await CDPConnection.connect(chrome_endpoint)
     target = await connection.command("Target.createTarget", {"url": fixture_site + "/web/chat/index"})
@@ -142,6 +153,7 @@ async def app(chrome_endpoint, fixture_site, tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_browser", browser)
     monkeypatch.setattr(server, "_scraper", None)
     monkeypatch.setattr(server, "_db", CandidateDB(str(tmp_path / "candidates.json")))
+    monkeypatch.setattr(server, "_history", RunHistory(tmp_path))
     monkeypatch.setattr(server, "PROFILE", {"job": {"title": "测试工程师", "city": "测试市"}, "keywords": ["Python", "SQL"], "scoring": {"tech_keywords": ["Python", "SQL"]}})
     yield {"browser": browser, "page": page, "server": server, "base": fixture_site, "tmp": tmp_path, "endpoint": chrome_endpoint}
     active = server._browser

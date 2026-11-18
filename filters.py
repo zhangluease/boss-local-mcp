@@ -27,24 +27,38 @@ def salary_range(value):
     return (float(match[1]), float(match[1])) if match else None
 
 
-def filter_loaded_candidates(candidates, city="", experience="", salary=""):
-    requested_years = years_range(experience) if experience and experience != "经验不限" else None
-    requested_salary = salary_range(salary) if salary and salary != "不限" else None
+def card_filter(city="", experience="", salary=""):
+    city = city.strip().removesuffix("市")
+    experience, salary = experience.strip(), salary.strip()
+    requested_years = years_range(experience) if experience not in ("", "经验不限") else None
+    requested_salary = salary_range(salary) if salary not in ("", "不限") else None
     if experience and experience != "经验不限" and requested_years is None:
         raise ValueError("experience 格式应为 3-5年、5年以上等")
     if salary and salary != "不限" and requested_salary is None:
         raise ValueError("salary 格式应为 20-30K 等带 K 单位的薪资区间")
-    result = []
-    for candidate in candidates:
-        if city and city.rstrip("市") not in str(candidate.get("expectCity", "")):
-            continue
-        if requested_years:
-            actual = years_range(candidate.get("experience"))
-            if actual is None or actual[0] > requested_years[1] or actual[1] < requested_years[0]:
+    def evaluate(candidate):
+        reasons = []
+        if city and city != "不限":
+            actual = str(candidate.get("expectCity") or "").strip()
+            if not actual or city not in actual:
+                reasons.append({"rule": "expected_city", "expected": city, "observed": actual,
+                                "result": "mismatch" if actual else "insufficient_evidence"})
+        for field, rule, value, expected, parse in (
+            ("experience", "total_experience", experience, requested_years, years_range),
+            ("salary", "expected_salary", salary, requested_salary, salary_range),
+        ):
+            if expected is None:
                 continue
-        if requested_salary:
-            actual = salary_range(candidate.get("salary"))
-            if actual is None or actual[0] > requested_salary[1] or actual[1] < requested_salary[0]:
-                continue
-        result.append(candidate)
-    return result
+            observed = str(candidate.get(field) or "").strip()
+            actual = parse(observed)
+            if actual is None or actual[0] > expected[1] or actual[1] < expected[0]:
+                reasons.append({"rule": rule, "expected": value, "observed": observed,
+                                "result": "mismatch" if actual else "insufficient_evidence"})
+        return reasons
+
+    return evaluate
+
+
+def filter_loaded_candidates(candidates, city="", experience="", salary=""):
+    evaluate = card_filter(city, experience, salary)
+    return [candidate for candidate in candidates if not evaluate(candidate)]
